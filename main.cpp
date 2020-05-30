@@ -19,13 +19,48 @@
 
 
 bool SetPath(int argc, char ** argv);
+std::string GetSavePath();
 DDSFile GetDDSFile(const char * name,  bg_Type type, DepthFile &);
 PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile &);
 
+
 DepthFile GetDepth();
+
+void MakeSphere(const int width, const int height)
+{
+	PngFile png("SphereHeightMap.png", bg_Type::Depth, 0);
+
+	png.size        = glm::ivec2(width, height);
+	png.color_type  = PngFile::ColorType::GRAY;
+	png.bit_depth   = 16;
+	png.channels    = 1;
+	png.bytesPerRow = 2 * width;
+
+	png.Alloc();
+
+	for(int y = 0; y < height; ++y)
+	{
+		uint16_t * ptr = (uint16_t*)(png.row_pointers[y]);
+
+		for(int x = 0; x < width; ++x)
+		{
+			auto vec    = glm::dvec2(x / (double) width, y / (double) height);
+			vec = (vec - .5) * 2.0;
+
+			auto height = std::sqrt(1.0 - (vec.x*vec.x + vec.y*vec.y));
+			height = glm::max(0.0, glm::min(height, 1.0));
+
+			ptr[x] = USHRT_MAX * height;
+		}
+	}
+
+	png.Write();
+}
 
 int main(int argc, char *argv[])
 {
+//	MakeSphere(2048, 2048);
+
 	try
 	{
 		if(!SetPath(argc, argv))
@@ -40,7 +75,12 @@ int main(int argc, char *argv[])
 		DDSFile BaseColor = GetDDSFile("BaseColor",        bg_Type::Diffuse, depth_file);
 		DDSFile Roughness = GetDDSFile("Roughness",        bg_Type::Roughness, depth_file);
 
-		BackgroundFile bg("background.lf_bck");
+		std::string save_path = GetSavePath();
+
+		if (save_path.empty())
+			return 0;
+
+		BackgroundFile bg(std::move(save_path));
 
 		if(bg.moreRecent(BaseColor)
 		&& bg.moreRecent(Depth)
@@ -252,3 +292,27 @@ bool SetPath(int argc, char ** argv)
 
 	return true;
 }
+
+std::string GetSavePath()
+{
+	std::string path;
+
+	char* buffer = nullptr;
+
+	switch (NFD_SaveDialog("lf_bck", nullptr, &buffer))
+	{
+	case NFD_ERROR:
+		throw BackgroundException(NFD_GetError());
+	case NFD_OKAY:
+		break;
+	case NFD_CANCEL:
+		return {};
+	default:
+		break;
+	}
+
+	path = buffer;
+	free(buffer);
+	return path;
+}
+

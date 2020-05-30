@@ -2,11 +2,14 @@
 #include "backgroundfile.h"
 #include "bg_type.h"
 #include "ddsfile.h"
+#include <zlib.h>
 #include <cstring>
 #include <algorithm>
 #include <type_traits>
 #include <climits>
 #include <cassert>
+#include <system_error>
+#include <cstdio>
 
 const char * bg_TypeName(bg_Type it)
 {
@@ -27,8 +30,8 @@ bool isTransparent(DXT5_Block & m);
 bool isTransparent(DXT1_Block & m);
 bool isTransparent(BC4_Block & m);
 
-BackgroundFile::BackgroundFile(const char * name) :
-	FileBase(name)
+BackgroundFile::BackgroundFile(std::string && name) :
+	FileBase(std::move(name))
 {
 
 }
@@ -64,7 +67,7 @@ void BackgroundFile::WriteOut()
 void BackgroundFile::WriteFile(FILE * fp)
 {
 	const char * title = "lbck";
-	short version = 2;
+	short version = VERSION;
 
 	size_t offset = ftell(fp);
 	uint16_t width = tiles_x * 256;
@@ -91,10 +94,14 @@ void BackgroundFile::WriteFile(FILE * fp)
 		{
 			mip[i*3 + j] = ftell(fp) - offset;
 
-			if(encoded[j] != nullptr && encoded[j][i].size())
+			if(encoded[j] != nullptr)
 			{
 				auto & vec = encoded[j][i];
-				fwrite(&vec[0], sizeof(uint8_t), encoded[j][i].size(), fp);
+
+				if(vec.size())
+				{
+					fwrite(&vec[0], sizeof(uint8_t), vec.size(), fp);
+				}
 			}
 		}
 	}
@@ -253,7 +260,7 @@ void BackgroundFile::Deinterleave()
 	enum
 	{
 		DiffOffset        = 0,
-		RoughOffset       = DiffOffset      + sizeof(DXT5_Block),
+		RoughOffset       = DiffOffset      + sizeof(DXT1_Block),
 		DepthOffset       = RoughOffset     + sizeof(DXT5_Block),
 		NormalOffset      = DepthOffset     + sizeof(BC5_Block),
 		DeinterlacedBytes = NormalOffset    + sizeof(BC5_Block),
@@ -263,7 +270,7 @@ void BackgroundFile::Deinterleave()
 	BC5_Block default_normals;
 
 	DXT5_Block default_roughness;
-	DXT5_Block default_diffuse;
+	DXT1_Block default_diffuse;
 
 	memset(&default_depth,     0, sizeof(default_depth));
 	memset(&default_normals,   0, sizeof(default_normals));
@@ -271,8 +278,7 @@ void BackgroundFile::Deinterleave()
 	memset(&default_diffuse,   0, sizeof(default_diffuse));
 
 //default diffuse is solid white
-	default_diffuse.color.c[0] = 0xFFFF;
-	default_diffuse.alpha.c[0] = 255;
+	default_diffuse.c[0] = 0xFFFF;
 
 //default roughness is 50% rough dialectric
 	default_roughness.color.c[0] = 0x0400;
@@ -349,6 +355,153 @@ void BackgroundFile::Deinterleave()
 		depth[i].reset();
 		normal[i].reset();
 	}
+}
+
+void ThrowZlib(int code)
+{
+	switch(code)
+	{
+	case Z_OK:
+		break;
+	case Z_STREAM_END:
+		break;
+	case Z_NEED_DICT:
+		throw std::runtime_error("need dict");
+	case Z_ERRNO:
+		throw std::system_error(errno, std::generic_category());
+	case Z_STREAM_ERROR:
+		throw std::runtime_error("zlib: stream error");
+	case Z_DATA_ERROR:
+		throw std::runtime_error("zlib: data error");
+	case Z_MEM_ERROR:
+		throw std::runtime_error("zlib: memory error");
+	case Z_BUF_ERROR:
+		throw std::runtime_error("zlib: buffer error");
+	case Z_VERSION_ERROR:
+		throw std::runtime_error("zlib: version error");
+	default:
+		throw std::runtime_error("unknown error");
+	}
+
+}
+
+#include <sstream>
+#include <iostream>
+#include <iomanip>
+
+std::string ToHex(const uint8_t * s, int length, bool upper_case  = true)
+{
+    std::ostringstream ret;
+
+    for (int i = 0; i < length; ++i)
+        ret << std::hex << std::setfill('0') << std::setw(2) << (upper_case ? std::uppercase : std::nouppercase) << (int)s[i];
+
+    return ret.str();
+}
+
+void BackgroundFile::Compress()
+{
+#if VERSION < 3
+	return;
+#endif
+
+	enum
+	{
+		BUFFER_SIZE = 350000,
+		P_LENGTH    = 20
+	};
+
+#define UNIT_TEST   0
+
+	z_stream zlib;
+	memset(&zlib, 0, sizeof(zlib));
+	int code = deflateInit(&zlib, Z_BEST_COMPRESSION);
+	ThrowZlib(code);
+
+	zlib.data_type = Z_BINARY;
+
+	std::unique_ptr<uint8_t[]> output_block(new uint8_t[BUFFER_SIZE]);
+
+#if UNIT_TEST
+	std::unique_ptr<uint8_t[]> decompress_block(new uint8_t[BUFFER_SIZE]);
+#endif
+
+	int total_steps = 3 * length(), step = 0, progress = 0;
+	char progress_bar[P_LENGTH];
+	memset(progress_bar, ' ', P_LENGTH);
+
+	printf("compressing image...\n");
+	printf("[%.*s]\r", P_LENGTH, progress_bar);
+
+	for(auto i = 0; i < 3; ++i)
+	{
+		if(encoded[i] == nullptr)
+			continue;
+
+		for(int j = 0; j < length(); ++j, ++step)
+		{
+			int percentage = (step + P_LENGTH/2) * P_LENGTH / total_steps;
+
+			if (percentage > progress)
+			{
+				progress_bar[(progress = percentage)-1] = '=';
+				printf("[%.*s]\r", P_LENGTH, progress_bar);
+			}
+
+			if(encoded[i][j].empty()) continue;
+
+			zlib.next_in  = &encoded[i][j][0];
+			zlib.avail_in = encoded[i][j].size();
+			zlib.total_in = 0;
+
+			zlib.next_out  = &output_block[0];
+			zlib.avail_out = BUFFER_SIZE;
+			zlib.total_out = 0;
+
+//need random reads...
+			int code = deflate(&zlib, Z_FULL_FLUSH);
+
+			if(zlib.msg != nullptr)
+				throw std::runtime_error(zlib.msg);
+
+			ThrowZlib(code);
+
+#if UNIT_TEST
+			z_stream alib;
+			memset(&alib, 0, sizeof(alib));
+			inflateInit(&alib);
+
+			alib.next_in = &output_block[0];
+			alib.avail_in = zlib.total_out;
+			alib.total_in = 0;
+
+			alib.next_out = &decompress_block[0];
+			alib.avail_out = BUFFER_SIZE;
+			alib.total_out = 0;
+
+			int code2 = inflate(&alib, Z_FINISH);
+
+			if(alib.msg != nullptr)
+				throw std::runtime_error(alib.msg);
+
+			if(alib.total_out != encoded[i][j].size())
+				throw std::runtime_error("decompressed size wrong");
+
+			if(memcmp(&encoded[i][j][0], &decompress_block[0], alib.total_out) != 0)
+				throw std::runtime_error("decompression failed?");
+
+			inflateEnd(&alib);
+#endif
+			encoded[i][j].resize(zlib.total_out);
+			memcpy(&encoded[i][j][0], &output_block[0], zlib.total_out);
+
+			deflateReset(&zlib);
+		}
+	}
+
+	printf("\n");
+
+	deflateEnd(&zlib);
 }
 
 struct Dimensions

@@ -331,8 +331,6 @@ void PngFile::Write()
 		if (!fp)
 			throw std::system_error(errno, std::generic_category());
 
-		int number_of_passes{};
-
         /* initialize stuff */
         png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
 
@@ -358,7 +356,7 @@ void PngFile::Write()
                      PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
 
         png_write_info(png_ptr, info_ptr);
-
+		png_set_swap(png_ptr);
 
         /* write bytes */
         if (setjmp(png_jmpbuf(png_ptr)))

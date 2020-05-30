@@ -82,7 +82,7 @@ uint8_t * Compress(uint8_t * dst, PngFile & file, int stride)
 			{
 			case bg_Type::Diffuse:
 				CopyRGBA(px, file, x, y);
-				squish::Compress(px, dst, squish::kDxt5 | squish::kColourIterativeClusterFit | squish::kWeightColourByAlpha);
+				squish::Compress(px, dst, squish::kDxt1 | squish::kColourIterativeClusterFit | squish::kWeightColourByAlpha);
 				break;
 			case bg_Type::Depth:
 				CopyChannelToA(px, file, x, y, 0);
@@ -121,7 +121,7 @@ void DDSFile::create(PngFile ** files, bg_Type type, int layers)
 {
 	switch(files[0]->type)
 	{
-	case bg_Type::Diffuse:   dx10_header.dxgiFormat = DXGI_FORMAT_BC3_UNORM; break;
+	case bg_Type::Diffuse:   dx10_header.dxgiFormat = DXGI_FORMAT_BC1_UNORM; break;
 	case bg_Type::Depth:     dx10_header.dxgiFormat = DXGI_FORMAT_BC5_UNORM; break;
 	case bg_Type::Normals:   dx10_header.dxgiFormat = DXGI_FORMAT_BC5_UNORM; break;
 	case bg_Type::Roughness: dx10_header.dxgiFormat = DXGI_FORMAT_BC1_UNORM; break;

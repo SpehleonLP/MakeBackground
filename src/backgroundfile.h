@@ -11,10 +11,16 @@
 class PngFile;
 class DDSFile;
 
+#define VERSION 3
 
 class BackgroundFile : public FileBase
 {
 public:
+	enum
+	{
+		MAX_MIP = 3
+	};
+
 	struct TileInfo
 	{
 		uint8_t  x0{0};
@@ -23,13 +29,13 @@ public:
 		uint8_t  y1{16};
 	};
 
-	BackgroundFile(const char * name);
+	BackgroundFile(std::string && name);
 
 	int CreateTileDimensions();
 	void ApplyTileDimensions();
 
 	void Deinterleave();
-	void Compress() {}
+	void Compress();
 
 
 	void WriteOut();
@@ -44,7 +50,7 @@ public:
 
 	std::unique_ptr<std::vector<uint8_t>[]> encoded[3];
 
-	BackgroundLayer<DXT5_Block> base_color; //dxt5
+	BackgroundLayer<DXT1_Block> base_color; //dxt1
 	BackgroundLayer<BC5_Block>  depth; //uint16_t
 	BackgroundLayer<BC5_Block>  normal;  //dxt5
 	BackgroundLayer<DXT5_Block> roughness; //dxt5
