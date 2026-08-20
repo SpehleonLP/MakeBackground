@@ -7,9 +7,12 @@ enum class bg_Type : int
 	Depth,
 	Normals,
 	Roughness,
-	Occlusion
+	Occlusion,
+	Platform
 };
 
 const char * bg_TypeName(bg_Type);
+const char * bg_FileName(bg_Type);
+
 
 #endif // BG_TYPE_H

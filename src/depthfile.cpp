@@ -3,17 +3,19 @@
 #include "png_file.h"
 #include "blurheightmap.h"
 #include "blur_config.h"
+#include <cstring>
 #include <algorithm>
 #include <iostream>
 
+
+
 DepthFile::DepthFile()
 {
-	ReadPlatformHeader();
 }
 
 void DepthFile::clear()
 {
-	height.reset();
+	m_height.clear();
 	platform_mask.reset();
 	platformMaskMask &= 0xF0;
 }
@@ -26,38 +28,38 @@ size_t DepthFile::GetOffset(int mip) const
 	     + (mip > 3) * (size.x * size.y) / 64;
 }
 
-uint8_t * DepthFile::GetPlatform(int mip)
+float const* DepthFile::GetHeight(int mip)
 {
-	if(platform == nullptr)
-		ReadPlatform();
+	if(m_height.empty())
+		Load();
 
 	platformMaskMask |= 0x10;
 	if(platformMaskMask & (0x10 << mip))
-		return &platform[GetOffset(mip)];
+		return &m_height[GetOffset(mip)];
 
 	platformMaskMask |= (0x10 << mip);
 
-	uint8_t * dst = &platform[GetOffset(mip)];
-	uint8_t * src = GetPlatform(mip-1);
+	float      * dst = &m_height[GetOffset(mip)];
+	float const* src = GetHeight(mip-1);
 
 	size_t width  = size.x >> mip;
 	size_t height = size.y >> mip;
 
-	std::unique_ptr<uint32_t[]> temp(new uint32_t[width*height]);
+	std::unique_ptr<float[]> temp(new float[size.x*size.y]);
 
 //copy into temp;
 	for(uint32_t y = 0; y < height; ++y)
 	{
 		for(uint32_t x = 0; x < width; ++x)
 		{
-			((uint8_t*) &temp[y*width+x])[0] = src[y*width*4 + x*2];
-			((uint8_t*) &temp[y*width+x])[1] = src[y*width*4 + x*2+1];
+			temp[(y*width+x)*4+0] = src[(y*2+0)*width*2 + x*2];
+			temp[(y*width+x)*4+1] = src[(y*2+0)*width*2 + x*2+1];
 		}
 
 		for(uint32_t x = 0; x < width; ++x)
 		{
-			((uint8_t*) &temp[y*width+x])[2] = src[(y*2+1)*width*2 + x*2];
-			((uint8_t*) &temp[y*width+x])[3] = src[(y*2+1)*width*2 + x*2+1];
+			temp[(y*width+x)*4+2] = src[(y*2+1)*width*2 + x*2];
+			temp[(y*width+x)*4+3] = src[(y*2+1)*width*2 + x*2+1];
 		}
 	}
 
@@ -65,54 +67,56 @@ uint8_t * DepthFile::GetPlatform(int mip)
 	{
 		for(uint32_t x = 0; x < width; ++x)
 		{
-			uint8_t * src = (uint8_t*) &temp[y*width+x];
-
-//if all the same use that.
-			if(src[0] == src[1]
-			&& src[1] == src[2]
-			&& src[2] == src[3])
-			{
-				dst[y*width+x] = src[0];
-				continue;
-			}
-
-//set to backmost
-			dst[y*width+x] = std::min(std::min(src[0], src[1]), std::min(src[2], src[3]));
-
-//get counts
-			uint8_t count[4]{0, 0, 0, 0};
-
-			for(int i = 0; i < 4; ++i)
-			{
-				count[0] += (src[0] == src[i]);
-				count[1] += (src[1] == src[i]);
-				count[2] += (src[2] == src[i]);
-				count[3] += (src[3] == src[i]);
-			}
-
-//if one of the components is only 1 thing; then we know we don't use it...
-			if((count[0] == 1) || (count[1] == 1) || (count[2] == 1) || (count[3] == 1))
-			{
-				for(int i = 0; i < 4; ++i)
-				{
-					if(count[i] >= 2)
-					{
-						dst[y*width+x] = src[i];
-						break;
-					}
-				}
-			}
+			auto ptr = &temp[(y*width+x)*4];
+			std::sort(ptr, ptr+4);
+			dst[y*width+x] = ptr[2];
 		}
 	}
 
 	return dst;
 }
 
+void DepthFile::CopyPlatform(PngFile & file, int mip)
+{
+	auto depth = GetHeight(mip);
+
+	file.size = size >> mip;
+	file.mip = mip;
+
+	file.type = bg_Type::Depth;
+
+	file.bit_depth  = 16;
+	file.channels = 1;
+
+	file.bytesPerRow = sizeof(uint16_t) * file.channels * file.size.x;
+	file.color_type = PngFile::ColorType::GRAY;
+
+	file.Alloc();
+
+	for(int y = 0; y < file.height(); ++y)
+	{
+		uint16_t * dst = (uint16_t*)(file.row_pointers[y]);
+		float const* src = &depth[y*file.width()];
+		auto multiple = 65536.f / MAX_DEPTH;
+
+		for(int x = 0; x < file.width()*file.channels; ++x)
+		{
+			dst[x] = (uint16_t) std::max(0, std::min<int>(src[x] * multiple, 65535));
+			//dst[x] = (dst[x] << 8) | (dst[x] >> 8);
+		}
+	}
+}
+
+//mip is the source of the downscale
 const uint32_t * DepthFile::GetPlatformMask(int mip)
 {
+	if(doesExist() == false)
+		return nullptr;
+
 	assert(mip < 3);
 
-	size_t start = GetOffset(mip) / 4;
+//used to be divided by 4 because RGBA
+	size_t start = GetOffset(mip);
 
 	if(platformMaskMask & (1 << mip))
 		return &platform_mask[start];
@@ -121,63 +125,68 @@ const uint32_t * DepthFile::GetPlatformMask(int mip)
 
 	if(platform_mask == nullptr)
 	{
-		platform_mask.reset(new uint32_t[GetOffset(4) / 4]);
-		memset(&platform_mask[0], 0, GetOffset(4));
+		platform_mask.reset(new uint32_t[GetOffset(4)]);
+		memset(&platform_mask[0], 0x00, GetOffset(4) * sizeof(platform_mask[0]));
 	}
 
-	uint32_t * mask = &platform_mask[start];
-	const uint8_t * src = GetPlatform(mip);
-	const uint8_t * dst = GetPlatform(mip+1);
+	uint32_t * mask     = &platform_mask[start];
+	const float * mip_0 = GetHeight(mip);
+	const float * mip_1 = GetHeight(mip+1);
 
-	int width  = size.x >> (mip+1);
-	int height = size.y >> (mip+1);
+	const glm::ivec2 size0  = size >> (mip);
+	const glm::ivec2 size1  = size >> (mip+1);
 
-//first vertically...
-	for(int y = 0; y < height; ++y)
+	for(int y = 0; y < size1.y; ++y)
 	{
-		for(int x = 0; x < width; ++x)
+		for(int x = 0; x < size1.x; ++x)
 		{
-			auto    p = dst[y*width + x];
-			uint8_t r = 0;
+			const auto dstCmp = mip_1[y*size1.x+x];
+			uint32_t & targ   = mask[y*size1.x+x];
 
-			for(int j = -2; j < +2; ++j)
+			targ = ~0u;
+			continue;
+
+			if(dstCmp != 0)
 			{
-				if(0 <= y+j && y+j < height)
-					r |= (dst[(y+j)*width + x] == p) << (j + 2)*2;
+				int break_point{};
+				++break_point;
 			}
 
-			r |= r << 1;
-			mask[y*width+x] = (r | (r << 8)) << 16;
-		}
-	}
-
-//now horizontally...
-	for(int y = 0; y < height; ++y)
-	{
-		for(int i = 0; i < 2; ++i)
-		{
-			uint32_t y0 = y * 2 + i;
-
-			for(int x = 0; x < width; ++x)
+			for(int yd = -2; yd < 2; ++yd)
 			{
-				auto    p = dst[y*width + x];
-				uint8_t r = 0;
+				const int y0 = y*2 + yd;
 
-				for(int j = -3; j <= 4; ++j)
+				if(!(0 <= y0 && y0 <= size0.y))
+					continue;
+
+				for(int xd = -2; xd < 2; ++xd)
 				{
-					if(0 <= x*2+j && x*2+j < width*2)
-						r |= (src[y0*(width*2) + x*2+j] == p) << (j + 3);
-				}
+					const int index = (yd+2)*4 + xd+2;
+					const int x0 = x*2 + xd;
 
-				mask[y*width+x] |= r << (8*i);
+					if(0 <= x0 && x0 <= size0.x)
+					{
+						auto srcCmp = mip_0[y0*size0.x + x0];
+// half a meter
+						if(std::fabs(srcCmp - dstCmp) < 8.f)
+							targ |= 1 << index;
+#ifndef NDEBUG
+						else
+						{
+							int break_point{};
+							++break_point;
+						}
+#endif
+					}
+				}
 			}
 		}
 	}
 
-
-	return &platform_mask[start];
+	return mask;
 }
 
+/*
 void DepthFile::WriteDepth(PngFile & r, float limit)
 {
 	Load();
@@ -214,8 +223,8 @@ void DepthFile::WriteDepth(PngFile & r, float limit)
 	}
 
 	r.Write();
-}
-
+}*/
+/*
 void DepthFile::CopyPlatform(PngFile & file)
 {
 	if(file.row_pointers == nullptr)
@@ -245,7 +254,7 @@ void DepthFile::CopyPlatform(PngFile & file)
 	}
 
 	if(platform == nullptr)
-		platform.reset(new uint8_t[size.x * size.y * 3 / 2]);
+		platform.reset(new uint32_t[size.x * size.y * 3 / 2]);
 
 //copy in...
 	for(int y = 0; y < size.y; ++y)
@@ -254,91 +263,101 @@ void DepthFile::CopyPlatform(PngFile & file)
 		auto dst = &platform[y * size.x];
 
 		for(int x = 0; x < size.x; ++x)
-			dst[x] = src[x*file.channels];
+		{
+			uint32_t color = 0;
+			for(int i = 0; i <= file.channels; ++i)
+			{
+				color |= src[x*file.channels] << (i*8);
+			}
+
+			dst[x] = color;
+		}
 	}
+}*/
+
+bool DepthFile::doesExist() const
+{
+	if(m_exists == -1)
+		m_exists = PngFile("Depth.png", bg_Type::Depth, 0).doesExist();
+
+	return m_exists;
 }
 
-void DepthFile::ReadPlatform()
+void DepthFile::ReadHeader()
 {
-	if(platform != nullptr)
+	if(size.x > 0 || size.y > 0)
 		return;
 
-	PngFile png("Platform.png", bg_Type::Depth, 0);
+	PngFile png("Depth.png", bg_Type::Depth, 0);
 
-	if(!png.doesExist()
-	&& !png.ChangePath("Depth.png")
-	&& !png.ChangePath("Depth.gen.png"))
-		throw BackgroundException("Unable to locate platform map");
-
-	CopyPlatform(png);
-	modified = png.modified;
-}
-
-void DepthFile::ReadPlatformHeader()
-{
-	if(platform != nullptr
-	|| size.x > 0 && size.y > 0)
-		return;
-
-	PngFile png("Platform.png", bg_Type::Depth, 0);
-
-	if(!png.doesExist()
-	&& !png.ChangePath("Depth.png")
-	&& !png.ChangePath("Depth.gen.png"))
-		throw BackgroundException("Unable to locate platform map");
+	if(!png.doesExist())
+	{
+		m_exists = 0;
+		throw BackgroundException("Unable to locate depth map");
+	}
 
 	png.ReadHeader();
 	size = png.size;
 	modified = png.modified;
-
-	CheckDepth("Height");
-	CheckDepth("Detail");
 }
 
-PngFile DepthFile::LocateDepth(std::string const& name)
+PngFile DepthFile::LocateDepth(std::string const& name, bool needFile)
 {
 	std::string p(name);
-	PngFile png(name, bg_Type::Depth, 0);
+	PngFile raw(name, bg_Type::Depth, 0);
 
-	if(png.ChangePath(p + "-16.png"))
-		return png;
+	if(raw.ChangePath(p + ".png"))
+	{
+		raw.ReadHeader();
 
-	PngFile  raw(p + ".png", bg_Type::Depth, 0);
+		if(raw.bit_depth == 16 && raw.channels == 1)
+			return raw;
+	}
+
+	if(!raw.doesExist())
+	{
+		if(needFile)
+			throw BackgroundException(std::string("Unable to locate ") + p + " map");
+
+		return raw;
+	}
 
 	FileBase config(p + "-Config.json");
-	png.ChangePath(p + "-16.gen.png");
+	PngFile png(p + "-16.gen.png", bg_Type::Depth, 0);
 
 	if(png.moreRecent(raw)
 	&& png.moreRecent(config))
 		return png;
 
-	if(!raw.doesExist())
-		throw BackgroundException(std::string("Unable to locate ") + p + " map");
+	throw BackgroundException(std::string("Unable to locate ") + p + " map");
 
-	raw.ReadHeader();
-
-	if(raw.bit_depth == 16)
-		return raw;
-
-	std::cout << "Generating " << name << "-16.gen.png (this can take a half hour)" << std::endl;
+#if 0
+	std::cout << "Generating " << name << "-16.gen.png (this can a while)" << std::endl;
 
 	auto stages = ReadConfiguration(config.path);
 	BlurHeightMap(png, raw, *this, stages);
 	png.Write();
+#endif
 	return png;
 }
 
 void DepthFile::CheckDepth(const char * name)
 {
-	PngFile png = LocateDepth(name);
-	modified = std::max(png.modified, modified);
+	PngFile png = LocateDepth(name, false);
+
+	if(png.doesExist())
+		modified = std::max(png.modified, modified);
 }
 
-void DepthFile::AddDepth(const char * name, float multiple)
+void DepthFile::AddDepth(const char * name, float multiple, bool needFile)
 {
 	std::string p(name);
 
-	PngFile png = LocateDepth(p);
+	PngFile png = LocateDepth(p, needFile);
+
+	if(!png.doesExist())
+		return;
+
 	png.Read();
 
 	modified = std::max(png.modified, modified);
@@ -351,7 +370,7 @@ void DepthFile::AddDepth(const char * name, float multiple)
 
 	if(png.bit_depth == 16)
 	{
-		multiple = multiple / (float) 0x00000100;
+		multiple = multiple / (float) 0x0010000;
 
 		for(int y = 0; y < png.height(); ++y)
 		{
@@ -360,9 +379,9 @@ void DepthFile::AddDepth(const char * name, float multiple)
 			for(int x = 0; x < png.width(); ++x)
 			{
 				auto v = src[x*png.channels + 0];
-				v = (v << 8) | (v >> 8);
+				//v = (v << 8) | (v >> 8);
 
-				height[y*png.width() + x] += (v * multiple);
+				m_height[y*png.width() + x] = (v * multiple);
 			}
 		}
 	}
@@ -373,8 +392,8 @@ void DepthFile::AddDepth(const char * name, float multiple)
 			throw BackgroundException(png.path + std::string(": 8 bit '-16' maps must be in RGB color space!"));
 		}
 
-		float mul_g = multiple;
-		float mul_b = multiple / (float) 0x00000100;
+		float mul_g = multiple / (float) 0x0010000;
+		float mul_b = multiple / (float) 0x0000100;
 
 		for(int y = 0; y < png.height(); ++y)
 		{
@@ -382,7 +401,7 @@ void DepthFile::AddDepth(const char * name, float multiple)
 
 			for(int x = 0; x < png.width(); ++x)
 			{
-				height[y*png.width() + x]
+				m_height[y*png.width() + x]
 					+= src[x*png.channels + 1] * mul_g
 					+  src[x*png.channels + 2] * mul_b;
 			}
@@ -392,32 +411,28 @@ void DepthFile::AddDepth(const char * name, float multiple)
 	{
 		throw BackgroundException(png.path + std::string(": not a 16 bit image."));
 	}
-
-
 }
-
 
 void DepthFile::Load()
 {
-	if(height != nullptr)
+	if(m_height.size())
 		return;
 
-	ReadPlatform();
+//	ReadPlatform();
 
 //--------------------------
-// create height and set to platform...
+// create depth
 //--------------------------
-	height.reset(new float[size.x * size.y]);
-
-	memset(&height[0], 0, sizeof(float) * size.x * size.y);
-
-	const int N = size.x * size.y;
-	for(int i = 0; i < N; ++i)
-		height[i] = platform[i];
+	m_height.resize(size.x * size.y * 3 / 2, 0.f);
+//	memset(&height[0], 0, sizeof(float) * size.x * size.y * 3 / 2);
 
 //--------------------------
 // Get 16 bit depth...
 //--------------------------
-	AddDepth("Height", 4);
-	AddDepth("Detail", 1);
+	float * top_row = &(m_height[0]);
+	float * bottom_row = &(m_height[(size.y-1) * size.x]);
+
+	AddDepth("Depth", MAX_DEPTH, true);
+
+//	AddDepth("Detail", 1, false);
 }

@@ -20,8 +20,10 @@ template<typename BC_ID>
 class BackgroundLayer
 {
 public:
-	BackgroundLayer() = default;
+typedef std::vector<BC_ID> TileData;
+typedef std::vector<TileData> TileArray;
 
+	BackgroundLayer() = default;
 
 	void SetFile(DDSFile & file)
 	{
@@ -46,14 +48,14 @@ public:
 			throw DDSException(file.path + ": image size does not match previous files");
 		}
 
-		const size_t no_tiles   = length();
+		//const size_t no_tiles   = length();
 		const int    BC         = file.GetBcId();
-		const int    stride     = file.GetStride();
+		const int    stride     = BC == 8? 32 : file.GetStride();
 
 		int blocks     = (256 * 256) / 16;
 
-		if(BC == 0)
-			throw DDSException(file.path + ": non-BC1-5 compression type");
+	//	if(BC == 0)
+	//		throw DDSException(file.path + ": non-BC1-5 compression type");
 
 		uint8_t * src = &file.data[0];
 
@@ -73,20 +75,40 @@ public:
 	uint32_t tiles_y{0};
 
 	size_t length() const { return tiles_x * tiles_y; }
+	bool empty() const { return length() == 0; }
 
 	time_t  modified{0};
 
-	std::unique_ptr<std::unique_ptr<BC_ID[]>[]> tiles[4];
-	std::unique_ptr<std::unique_ptr<BC_ID[]>[]> & operator[](int i) { return tiles[i]; }
+	std::vector<std::vector<BC_ID>> tiles[4];
+	std::vector<std::vector<BC_ID>> & operator[](int i) { return tiles[i]; }
 
 private:
-	void CopyTiles(std::unique_ptr<std::unique_ptr<BC_ID[]>[]> & dst, const uint8_t * src, int tile_size, int BC)
+	void CreateTile(std::vector<BC_ID> & dst, int blocks)
+	{
+		if(dst.empty())
+		{
+			BC_ID bc;
+			memset(&bc, 0, sizeof(BC_ID));
+			dst.resize(blocks, bc);
+		}
+	}
+
+	void CreateTile(std::unique_ptr<BC_ID[]> & dst, int blocks)
+	{
+		if(dst == nullptr)
+		{
+			dst.reset(new BC_ID[blocks]);
+			memset(&dst[0], 0, sizeof(BC_ID)*blocks);
+		}
+	}
+
+	void CopyTiles(TileArray & dst, const uint8_t * src, int tile_size, int BC)
 	{
 		const int blocks = (tile_size * tile_size) / 16;
 		const int tiles  = tiles_x * tiles_y;
 
-		if(dst == nullptr)
-			dst = std::unique_ptr<std::unique_ptr<BC_ID[]>[]>(new std::unique_ptr<BC_ID[]>[tiles]);
+		if(dst.empty())
+			dst.resize(tiles);
 
 		const int tile_width = tile_size / 4;
 		const int row_width  = tile_width * tiles_x;
@@ -96,11 +118,7 @@ private:
 			const int x_offset = (i % tiles_x) * tile_width;
 			const int y_offset = (i / tiles_x) * tile_width;
 
-			if(dst[i] == nullptr)
-			{
-				dst[i] = std::unique_ptr<BC_ID[]>(new BC_ID[blocks]);
-				memset(&dst[i][0], 0, blocks * sizeof(BC_ID));
-			}
+			CreateTile(dst[i], blocks);
 
 			for(int j = 0; j < blocks; ++j)
 			{
@@ -113,4 +131,37 @@ private:
 	}
 
 };
+
+
+template<>
+inline void BackgroundLayer<DepthBlock>::CopyTiles(TileArray & dst, const uint8_t * file_data, int tile_size, int )
+{
+	const uint16_t * src = (uint16_t const*)file_data;
+	const int blocks = (tile_size * tile_size) / 16;
+	const int tiles  = tiles_x * tiles_y;
+
+	if(dst.empty())
+		dst.resize(tiles);
+
+	const int tile_width = tile_size;
+	const int row_width  = tile_width * tiles_x;
+
+	for(int i = 0; i < tiles; ++i)
+	{
+		const int x_offset = (i % tiles_x) * tile_width;
+		const int y_offset = (i / tiles_x) * tile_width;
+
+		CreateTile(dst[i], blocks);
+
+		for(int j = 0; j < blocks; ++j)
+		{
+			const int x = ((j*16) % tile_width);
+			const int y = ((j*16) / tile_width);
+
+			int block_id = (y_offset + y) * row_width + x_offset + x;
+
+			memcpy(dst[i][j].depth, &src[block_id], sizeof(DepthBlock));
+		}
+	}
+}
 #endif // BACKGROUNDLAYER_H

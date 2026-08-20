@@ -3,13 +3,18 @@
 #include "src/png_file.h"
 #include "src/depthfile.h"
 #include "src/ddsfile.h"
+#include "src/alphafile.h"
 #include "src/generatenormals.h"
 #include "src/generateocclusion.h"
+#include "src/gltffile.h"
 #include <glm/vec2.hpp>
+#include <optional>
 #include <sstream>
 #include <nfd.h>
 #include <boxer/boxer.h>
 #include <iostream>
+#include <cassert>
+#include <thread>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -17,10 +22,15 @@
 #include <unistd.h>
 #endif
 
+enum BlockType
+{
+	ShadowVolume = 0x57444853,
+};
+
 
 bool SetPath(int argc, char ** argv);
-std::string GetSavePath();
-DDSFile GetDDSFile(const char * name,  bg_Type type, DepthFile &);
+std::string GetSavePath(int argc, char *argv[]);
+DDSFile GetDDSFile(bg_Type type, DepthFile &, AlphaFile & alpha);
 PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile &);
 
 
@@ -59,75 +69,153 @@ void MakeSphere(const int width, const int height)
 
 int main(int argc, char *argv[])
 {
-//	MakeSphere(2048, 2048);
-
+#ifdef NDEBUG
 	try
 	{
+#endif
 		if(!SetPath(argc, argv))
 			return 0;
 
-		auto depth_file  = GetDepth();
+		DepthFile depthFile;
+		AlphaFile alphaMask;
 
-		DDSFile Depth     = GetDDSFile("Depth",            bg_Type::Depth, depth_file);
-		DDSFile Normals   = GetDDSFile("Normals",          bg_Type::Normals, depth_file);
-		DDSFile Occlusion = GetDDSFile("AmbientOcclusion", bg_Type::Occlusion, depth_file);
+		try
+		{
+			depthFile = GetDepth();
+			alphaMask.Load(depthFile);
+		}
+		catch(std::exception & e)
+		{
+			char buffer[256];
+			snprintf(buffer, sizeof(buffer), "%s, Create unlit background?", e.what());
+			auto selection = boxer::show(buffer, "MakeBackground", boxer::Style::Question, boxer::Buttons::YesNo);
 
-		DDSFile BaseColor = GetDDSFile("BaseColor",        bg_Type::Diffuse, depth_file);
-		DDSFile Roughness = GetDDSFile("Roughness",        bg_Type::Roughness, depth_file);
+			if(selection == boxer::Selection::No)
+				return 0;
 
-		std::string save_path = GetSavePath();
+			DDSFile BaseColor = GetDDSFile(bg_Type::Diffuse, depthFile, alphaMask);
+
+			std::string save_path = GetSavePath(argc, argv);
+
+			if (save_path.empty())
+				return 0;
+
+			BackgroundFile bg(std::move(save_path));
+
+			bg.base_color.SetFile(BaseColor);
+
+			bg.CreateTileDimensions(alphaMask);
+
+			bg.Deinterleave();
+			bg.Compress();
+
+			bg.WriteOut();
+
+			return 0;
+		}
+
+		std::array<std::optional<DDSFile>, 5> _files;
+
+#if 0
+		for(int i = 0; i < 5; ++i)
+		{
+			_files[i] = GetDDSFile((bg_Type)i, depthFile, alphaMask);
+		}
+#else
+		{
+			std::array<std::unique_ptr<std::thread>, 5> _getters;
+
+			for(int i = 0; i < 5; ++i)
+			{
+				_getters[i] = std::make_unique<std::thread>([&_files, &depthFile, &alphaMask, i] { _files[i] = GetDDSFile((bg_Type)i, depthFile, alphaMask); });
+			}
+
+			bool need_stop = false;
+			for(auto i = 0u; i < _getters.size(); ++i)
+			{
+				if(_getters[i])
+				{
+					_getters[i]->join();
+
+					if(!_files[i])
+						need_stop = true;
+				}
+			}
+
+			if(need_stop)
+				return -1;
+		}
+#endif
+
+
+		DDSFile & BaseColor = *_files[int(bg_Type::Diffuse)];
+		DDSFile & Depth     = *_files[int(bg_Type::Depth)];
+		DDSFile & Normals   = *_files[int(bg_Type::Normals)];
+		DDSFile & Occlusion = *_files[int(bg_Type::Occlusion)];
+		DDSFile & Roughness = *_files[int(bg_Type::Roughness)];
+		auto gltfShadow = gltfFile("ShadowVolume.glb");
+
+		std::string save_path = GetSavePath(argc, argv);
 
 		if (save_path.empty())
 			return 0;
 
 		BackgroundFile bg(std::move(save_path));
-
+/*
 		if(bg.moreRecent(BaseColor)
 		&& bg.moreRecent(Depth)
 		&& bg.moreRecent(Normals)
 		&& bg.moreRecent(Roughness)
-		&& bg.moreRecent(Occlusion))
-			return 0;
+		&& bg.moreRecent(Occlusion)
+		&& bg.moreRecent(gltfShadow))
+			return 0;*/
+
+		gltfShadow.LoadItUp();
+		gltfShadow.Compress();
 
 		bg.base_color.SetFile(BaseColor);
 		bg.depth.SetFile(Depth);
 		bg.normal.SetFile(Normals);
-		bg.roughness.SetFile(Occlusion);
+		bg.occlusion.SetFile(Occlusion);
 		bg.roughness.SetFile(Roughness);
 
-		bg.CreateTileDimensions();
-		bg.ApplyTileDimensions();
+		bg.CreateTileDimensions(alphaMask);
 
 		bg.Deinterleave();
 		bg.Compress();
 
+		if(gltfShadow.doesExist())
+			bg.Append(ShadowVolume, std::move(gltfShadow.compressed));
+
 		bg.WriteOut();
+
+#ifdef NDEBUG
 	}
 	catch(std::exception & e)
 	{
 		boxer::show(e.what(), "MakeBackground", boxer::Style::Error, boxer::Buttons::Quit);
 	}
+#endif
 
 	return 0;
 }
 
 DepthFile GetDepth()
 {
-	glm::ivec2 size;
-
 	DepthFile depth_map;
 
 	PngFile depth("Depth.png", bg_Type::Depth, 0);
 
 	if (depth.doesExist() == false)
 	{
-		if (!depth.ChangePath("Depth.gen.png")
-			|| depth.modified < depth_map.modified)
-		{
-			std::cout << "Generating Depth.gen.png" << std::endl;
-			depth_map.WriteDepth(depth, 5);
-		}
+		throw std::runtime_error("Unable to locate Depth.png, stopping.");
 	}
+
+	depth_map.ReadHeader();
+	depth_map.Load();
+
+//create platform maps
+	GetPngFile("Platform", bg_Type::Platform, 3, depth_map);
 
 //------------------------
 // Generate Normals
@@ -158,8 +246,9 @@ DepthFile GetDepth()
 	return depth_map;
 }
 
-DDSFile GetDDSFile(const char * name, bg_Type type, DepthFile & depth)
+DDSFile GetDDSFile(bg_Type type, DepthFile & depth, AlphaFile & alpha)
 {
+	auto name = bg_FileName(type);
 	char file_name[64];
 	snprintf(file_name, 64, "%s.dds", name);
 
@@ -167,6 +256,13 @@ DDSFile GetDDSFile(const char * name, bg_Type type, DepthFile & depth)
 	PngFile mip1 = GetPngFile(name, type, 1, depth);
 	PngFile mip2 = GetPngFile(name, type, 2, depth);
 	PngFile mip3 = GetPngFile(name, type, 3, depth);
+
+	PngFile * mip[4];
+
+	mip[0] = &mip0;
+	mip[1] = &mip1;
+	mip[2] = &mip2;
+	mip[3] = &mip3;
 
 	DDSFile file(file_name);
 
@@ -179,23 +275,15 @@ DDSFile GetDDSFile(const char * name, bg_Type type, DepthFile & depth)
 	&& file.moreRecent(mip3))
 		return file;
 
-	PngFile * mip[4];
-
-	mip[0] = &mip0;
-	mip[1] = &mip1;
-	mip[2] = &mip2;
-	mip[3] = &mip3;
-
 	std::cout << "Generating " << bg_TypeName(type) << ".DDS..." << std::endl;
 
-	file.create(mip, type, 4);
+	file.create(mip, type, 4, alpha);
 	file.Write();
 
 	return file;
 }
 
-
-PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile & depth)
+PngFile LocatePngFile(const char * name, bg_Type type, int mip)
 {
 	char buffer[128];
 
@@ -216,7 +304,23 @@ PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile & depth)
 		file.ChangePath(buffer);
 	}
 
-	if(mip != 0)
+	return file;
+}
+
+void CreateMipMap(PngFile & file, const char * name, bg_Type type, int mip, DepthFile & depth)
+{
+	if(mip == 0 && type == bg_Type::Platform)
+	{
+		if(!depth.doesExist())
+			throw std::logic_error("Cannot create platform map without depth map");
+
+		if(!file.moreRecent(depth.modified))
+		{
+			depth.CopyPlatform(file, mip);
+			file.Write();
+		}
+	}
+	else if(mip != 0)
 	{
 		PngFile base = GetPngFile(name, type, mip-1, depth);
 
@@ -224,10 +328,24 @@ PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile & depth)
 		{
 			std::cout << "Generating " << bg_TypeName(type) << "-mip" << mip << ".gen.png" << std::endl;
 
-			file.Scale(depth, base);
+			if(type == bg_Type::Platform)
+			{
+				if(!depth.doesExist())
+					throw std::logic_error("Cannot create platform map without depth map");
+
+				depth.CopyPlatform(file, mip);
+			}
+			else
+				file.Scale(depth, base);
+
 			file.Write();
 		}
 	}
+}
+
+void ValidatePngFileSize(PngFile & file, bg_Type type, int mip, DepthFile & depth)
+{
+	char buffer[128];
 
 	if(file.doesExist())
 	{
@@ -242,7 +360,10 @@ PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile & depth)
 				throw BackgroundException(buffer);
 			}
 
-			depth.ReadPlatformHeader();
+			if(!depth.doesExist())
+				return;
+
+			depth.ReadHeader();
 
 			if(file.width() << mip != depth.size.x
 			|| file.height() << mip != depth.size.y)
@@ -252,7 +373,14 @@ PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile & depth)
 			}
 		}
 	}
+}
 
+
+PngFile GetPngFile(const char * name, bg_Type type, int mip, DepthFile & depth)
+{
+	auto file = LocatePngFile(name, type, mip);
+	CreateMipMap(file, name, type, mip, depth);
+	ValidatePngFileSize(file, type, mip, depth);
 	return file;
 }
 
@@ -293,8 +421,31 @@ bool SetPath(int argc, char ** argv)
 	return true;
 }
 
-std::string GetSavePath()
+std::string ConfirmExtension(std::string && str)
 {
+	if(str.empty())
+		return "";
+
+	auto pos = str.find_last_of('.');
+
+	if(str.size() - pos != 7)
+		return str + ".lf_bck";
+
+	char buffer[6];
+	for(uint32_t i = pos+1; i < str.size(); ++i)
+		buffer[i-(pos+1)] = tolower(str[i]);
+
+	if(memcmp(buffer, "lf_bck", 6) == 0)
+		return std::move(str);
+
+	return str + ".lf_bck";
+}
+
+std::string GetSavePath(int argc, char *argv[])
+{
+	if(argc > 2)
+		return ConfirmExtension(argv[2]);
+
 	std::string path;
 
 	char* buffer = nullptr;
@@ -313,6 +464,6 @@ std::string GetSavePath()
 
 	path = buffer;
 	free(buffer);
-	return path;
+	return ConfirmExtension(std::move(path));
 }
 

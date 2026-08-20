@@ -2,7 +2,7 @@
 #include "backgroundfile.h"
 #include "bg_type.h"
 #include "ddsfile.h"
-#include <zlib.h>
+#include "alphafile.h"
 #include <cstring>
 #include <algorithm>
 #include <type_traits>
@@ -10,6 +10,28 @@
 #include <cassert>
 #include <system_error>
 #include <cstdio>
+#include <glm/vec2.hpp>
+
+#include "lz4/lib/lz4.h"
+#include "lz4/lib/lz4hc.h"
+
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#define __debugbreak() { asm("int3"); }
+#endif
+
+#ifndef NDEBUG
+#define dbg(x) if(x) __debugbreak()
+#endif
+
+const char * bg_FileName(bg_Type it)
+{
+	const char * bg_Labels[] = { "BaseColor", "Depth", "Normals", "MetallicRoughness", "AmbientOcclusion" };
+
+	return bg_Labels[(int)it];
+
+}
 
 const char * bg_TypeName(bg_Type it)
 {
@@ -19,7 +41,8 @@ const char * bg_TypeName(bg_Type it)
 		"Depth",
 		"Normals",
 		"Roughness",
-		"Occlusion"
+		"Occlusion",
+		"Platform"
 	};
 
 	return name[(int)it];
@@ -61,13 +84,29 @@ void BackgroundFile::WriteOut()
 	fwrite(image_offsets, sizeof(uint32_t), 32, fp);
 */
 	WriteFile(fp);
+
+	for(auto & datablock : m_datablocks)
+	{
+		uint32_t length = datablock.buffer.size();
+
+		if(datablock.buffer.size() != length)
+			throw std::runtime_error("datablock too large");
+
+		fwrite("BLCK", 1, 4, fp);
+		fwrite(&datablock.typeId, 1, 4, fp);
+		fwrite(&length, 1, 4, fp);
+		fwrite(datablock.buffer.data(), 1, length, fp);
+
+		datablock.buffer.clear();
+	}
+
 	fclose(fp);
 }
 
 void BackgroundFile::WriteFile(FILE * fp)
 {
 	const char * title = "lbck";
-	short version = VERSION;
+	short version = VERSION | (unlit? 0x8000 : 0);
 
 	size_t offset = ftell(fp);
 	uint16_t width = tiles_x * 256;
@@ -82,7 +121,7 @@ void BackgroundFile::WriteFile(FILE * fp)
 
 	fwrite(&tile_info[0], sizeof(TileInfo), length(), fp);
 
-	std::vector<uint32_t> mip(3 * length() + 1, 0);
+	std::vector<uint32_t> mip(MAX_MIP * length() + 1, 0);
 
 	fpos_t position;
 	fgetpos(fp, &position);
@@ -90,9 +129,9 @@ void BackgroundFile::WriteFile(FILE * fp)
 
 	for(int i = 0; i < length(); ++i)
 	{
-		for(int j = 0; j < 3; ++j)
+		for(int j = 0; j < MAX_MIP; ++j)
 		{
-			mip[i*3 + j] = ftell(fp) - offset;
+			mip[i*MAX_MIP + j] = ftell(fp) - offset;
 
 			if(encoded[j] != nullptr)
 			{
@@ -110,6 +149,8 @@ void BackgroundFile::WriteFile(FILE * fp)
 
 	fsetpos(fp, &position);
 	fwrite(&mip[0], sizeof(mip[0]), mip.size(), fp);
+
+	fseek(fp, 0, SEEK_END);
 }
 
 void * deinterleave_primitive(void * r_dst, void * r_src, int blocks, int bytes, int stride)
@@ -209,6 +250,14 @@ void * deinterleave_block(void * dst, BC5_Block * src, int blocks)
 	return dst;
 }
 
+void * deinterleave_block(void * dst, DepthBlock * src, int blocks)
+{
+	DepthBlock * targ = (DepthBlock*)dst;
+	for(int i = 0; i < blocks; ++i, ++targ)
+		*targ = *src;
+	return targ;
+}
+
 
 void * deinterleave(void * dst, DXT1_Block * src, int blocks, int stride = sizeof(DXT1_Block))
 {
@@ -249,27 +298,75 @@ void * deinterleave(void * dst, DXT5_Block * src, int blocks)
 
 void * deinterleave(void * dst, BC5_Block * src, int blocks)
 {
+#if DEINTERLEAVE
 	dst = deinterleave(dst, &src[0].R, blocks, sizeof(BC5_Block));
 	dst = deinterleave(dst, &src[0].G, blocks, sizeof(BC5_Block));
+#else
+	memcpy(dst, &src[0], blocks * sizeof(src[0]));
+	return (uint8_t *) dst + (blocks * sizeof(src[0]));
+#endif
 
 	return dst;
 }
 
+void * deinterleave(void * dst, DepthBlock * src, int blocks)
+{
+	int pixels = blocks * sizeof(*src) / sizeof(uint16_t);
+	assert(pixels * sizeof(uint16_t) == blocks * sizeof(DepthBlock));
+
+#if DEINTERLEAVE
+	uint8_t * dst0 = (uint8_t*)dst;
+	uint8_t * src0 = (uint8_t*)src;
+
+	for(int i = 0; i < pixels; ++i)
+	{
+		dst0[i] = src0[i*2+0];
+	}
+
+	for(int i = 0; i < pixels; ++i)
+	{
+		dst0[i+pixels] = src0[i*2+1];
+	}
+
+	int8_t * ptr = (int8_t*)dst;
+	for(int i = blocks*2-1; i > 0; --i)
+	{
+		ptr[i] = ptr[i] - ptr[i-1];
+	}
+
+#else
+	memcpy(dst, src, blocks * sizeof(*src));
+#endif
+
+	return (DepthBlock*)dst + blocks;
+}
+
 void BackgroundFile::Deinterleave()
 {
-	enum
-	{
-		DiffOffset        = 0,
-		RoughOffset       = DiffOffset      + sizeof(DXT1_Block),
-		DepthOffset       = RoughOffset     + sizeof(DXT5_Block),
-		NormalOffset      = DepthOffset     + sizeof(BC5_Block),
-		DeinterlacedBytes = NormalOffset    + sizeof(BC5_Block),
+	unlit = depth.empty();
+
+	enum {
+		BaseColorBlockSize = sizeof(DXT1_Block),
+		RoughBlockSize		= sizeof(BC5_Block),
+		NormalBlockSize		= sizeof(BC5_Block),
+		OcclusionBlockSize  = sizeof(BC4_Block),
+		DepthBlockSize      = 2*16,
 	};
 
-	BC5_Block default_depth;
+	enum
+	{
+		BaseColorOffset   = 0,
+		RoughOffset       = BaseColorOffset + BaseColorBlockSize,
+		NormalOffset      = RoughOffset     + RoughBlockSize,
+		OcclusionOffset   = NormalOffset    + NormalBlockSize,
+		DepthOffset       = OcclusionOffset + OcclusionBlockSize,
+		DeinterlacedBytes = DepthOffset     + DepthBlockSize,
+	};
+
+	DepthBlock default_depth;
 	BC5_Block default_normals;
 
-	DXT5_Block default_roughness;
+	BC5_Block default_roughness;
 	DXT1_Block default_diffuse;
 
 	memset(&default_depth,     0, sizeof(default_depth));
@@ -281,82 +378,97 @@ void BackgroundFile::Deinterleave()
 	default_diffuse.c[0] = 0xFFFF;
 
 //default roughness is 50% rough dialectric
-	default_roughness.color.c[0] = 0x0400;
-	default_roughness.alpha.c[0] = 255;
+	default_roughness.R.c[0] = 128;
+	default_roughness.G.c[0] = 0;
 
 //default depth is 1 away from sky
-	default_depth.R.c[0] = 1;
+	//default_depth.R.c[0] = 1;
 
 //default normals point forward
 	default_normals.R.c[0] = 128;
 	default_normals.G.c[0] = 128;
 
-	for(int i = 0; i < 3; ++i)
+	for(int i = 0; i < MAX_MIP; ++i)
 	{
 		if(encoded[i] == nullptr)
 			encoded[i] = std::unique_ptr<std::vector<uint8_t>[]>(new std::vector<uint8_t>[length()]);
 
 		for(int j = 0; j < length(); ++j)
 		{
-			const int w = (tile_info[j].x1 - tile_info[j].x0) << (2 - i);
-			const int h = (tile_info[j].y1 - tile_info[j].y0) << (2 - i);
+			const int w = 256/4 >> i;
+			const int h = 256/4 >> i;
 
 			const size_t blocks = (w*h);
-			if(blocks == 0) continue;
+			if(tile_info[j].flags == 0) continue;
 
-			const size_t bytes = blocks * DeinterlacedBytes;
+			const size_t bytes = depth.empty()? blocks * BaseColorBlockSize : blocks * DeinterlacedBytes;
 
 			encoded[i][j].resize(bytes);
 			auto & vec = encoded[i][j];
 
-			if(base_color[i] && base_color[i][j])
+			if(base_color[i].size() && base_color[i][j].size())
 			{
-				deinterleave(&vec[blocks*DiffOffset], base_color[i][j].get(), blocks);
-				base_color[i][j].reset();
+				deinterleave(&vec[blocks*BaseColorOffset], base_color[i][j].data(), blocks);
+				base_color[i][j].clear();
 			}
 			else
 			{
-				deinterleave_block(&vec[blocks*DiffOffset], &default_diffuse, blocks);
+				deinterleave_block(&vec[blocks*BaseColorOffset], &default_diffuse, blocks);
 			}
 
-			if(roughness[i] && roughness[i][j])
+//unlit doesn't have these layers
+			if(!depth.empty())
 			{
-				deinterleave(&vec[blocks*RoughOffset], roughness[i][j].get(), blocks);
-				roughness[i][j].reset();
-			}
-			else
-			{
-				deinterleave_block(&vec[blocks*RoughOffset], &default_roughness, blocks);
-			}
+				if(roughness[i].size() && roughness[i][j].size())
+				{
+					deinterleave(&vec[blocks*RoughOffset], roughness[i][j].data(), blocks);
+					roughness[i][j].clear();
+				}
+				else
+				{
+					deinterleave_block(&vec[blocks*RoughOffset], &default_roughness, blocks);
+				}
 
-			if(depth[i] && depth[i][j])
-			{
-				deinterleave(&vec[blocks*DepthOffset], depth[i][j].get(), blocks);
-				depth[i][j].reset();
-			}
-			else
-			{
-				deinterleave_block(&vec[blocks*RoughOffset], &default_depth, blocks);
-			}
+				if(normal[i].size() && normal[i][j].size())
+				{
+					deinterleave(&vec[blocks*NormalOffset], normal[i][j].data(), blocks);
+					normal[i][j].clear();
+				}
+				else
+				{
+					deinterleave_block(&vec[blocks*NormalOffset], &default_normals, blocks);
+				}
 
-			if(normal[i] && normal[i][j])
-			{
-				deinterleave(&vec[blocks*NormalOffset], normal[i][j].get(), blocks);
-				normal[i][j].reset();
-			}
-			else
-			{
-				deinterleave_block(&vec[blocks*RoughOffset], &default_normals, blocks);
+				if(occlusion[i].size() && occlusion[i][j].size())
+				{
+					deinterleave(&vec[blocks*OcclusionOffset], occlusion[i][j].data(), blocks);
+					occlusion[i][j].clear();
+				}
+				else
+				{
+					deinterleave_block(&vec[blocks*OcclusionOffset], &default_normals, blocks);
+				}
+
+				if(depth[i].size() && depth[i][j].size())
+				{
+					deinterleave(&vec[blocks*DepthOffset], depth[i][j].data(), blocks);
+					depth[i][j].clear();
+				}
+				else
+				{
+					deinterleave_block(&vec[blocks*DepthOffset], &default_depth, blocks);
+				}
 			}
 		}
 
-		base_color[i].reset();
-		roughness[i].reset();
-		depth[i].reset();
-		normal[i].reset();
+		base_color[i].clear();
+		roughness[i].clear();
+		depth[i].clear();
+		normal[i].clear();
+		occlusion[i].clear();
 	}
 }
-
+/*
 void ThrowZlib(int code)
 {
 	switch(code)
@@ -383,7 +495,7 @@ void ThrowZlib(int code)
 		throw std::runtime_error("unknown error");
 	}
 
-}
+}*/
 
 #include <sstream>
 #include <iostream>
@@ -399,6 +511,8 @@ std::string ToHex(const uint8_t * s, int length, bool upper_case  = true)
     return ret.str();
 }
 
+#define UNIT_TEST   0
+
 void BackgroundFile::Compress()
 {
 #if VERSION < 3
@@ -408,9 +522,55 @@ void BackgroundFile::Compress()
 	enum
 	{
 		BUFFER_SIZE = 350000,
+		DEPTH_BUFFER_SIZE = 2 * 256 * 256 * sizeof(uint16_t),
+		TOTAL_SIZE = BUFFER_SIZE + DEPTH_BUFFER_SIZE,
 		P_LENGTH    = 20
 	};
 
+	auto output_size = LZ4_compressBound(TOTAL_SIZE);
+	std::vector<uint8_t> output_block(output_size);
+
+	int total_steps = MAX_MIP * length(), step = 0, progress = 0;
+	char progress_bar[P_LENGTH];
+	memset(progress_bar, ' ', P_LENGTH);
+
+	printf("compressing image...\n");
+	printf("[%.*s]\r", P_LENGTH, progress_bar);
+
+	for(auto i = 0; i < MAX_MIP; ++i)
+	{
+		if(encoded[i] == nullptr)
+			continue;
+
+		for(int j = 0; j < length(); ++j, ++step)
+		{
+			int percentage = (step + P_LENGTH/2) * P_LENGTH / total_steps;
+
+			if (percentage > progress)
+			{
+				progress_bar[(progress = percentage)-1] = '=';
+				printf("[%.*s]\r", P_LENGTH, progress_bar);
+			}
+
+			if(encoded[i][j].empty()) continue;
+
+			output_block.resize(LZ4_compressBound(TOTAL_SIZE));
+			int total_out = LZ4_compress_HC(
+				(const char*)&encoded[i][j][0],
+				(char*)output_block.data(),
+				encoded[i][j].size(),
+				output_block.size(),
+				LZ4HC_CLEVEL_MAX);
+
+			output_block.resize(total_out);
+
+			encoded[i][j].swap(output_block);
+		}
+	}
+
+	printf("\n");
+
+/*
 #define UNIT_TEST   0
 
 	z_stream zlib;
@@ -420,20 +580,20 @@ void BackgroundFile::Compress()
 
 	zlib.data_type = Z_BINARY;
 
-	std::unique_ptr<uint8_t[]> output_block(new uint8_t[BUFFER_SIZE]);
+	std::unique_ptr<uint8_t[]> output_block(new uint8_t[TOTAL_SIZE]);
 
 #if UNIT_TEST
 	std::unique_ptr<uint8_t[]> decompress_block(new uint8_t[BUFFER_SIZE]);
 #endif
 
-	int total_steps = 3 * length(), step = 0, progress = 0;
+	int total_steps = MAX_MIP * length(), step = 0, progress = 0;
 	char progress_bar[P_LENGTH];
 	memset(progress_bar, ' ', P_LENGTH);
 
 	printf("compressing image...\n");
 	printf("[%.*s]\r", P_LENGTH, progress_bar);
 
-	for(auto i = 0; i < 3; ++i)
+	for(auto i = 0; i < MAX_MIP; ++i)
 	{
 		if(encoded[i] == nullptr)
 			continue;
@@ -455,7 +615,7 @@ void BackgroundFile::Compress()
 			zlib.total_in = 0;
 
 			zlib.next_out  = &output_block[0];
-			zlib.avail_out = BUFFER_SIZE;
+			zlib.avail_out = TOTAL_SIZE;
 			zlib.total_out = 0;
 
 //need random reads...
@@ -501,73 +661,10 @@ void BackgroundFile::Compress()
 
 	printf("\n");
 
-	deflateEnd(&zlib);
+	deflateEnd(&zlib);*/
 }
 
-struct Dimensions
-{
-	short min_x{64};
-	short min_y{64};
-	short max_x{0};
-	short max_y{0};
-
-	bool isFull()
-	{
-		return min_x == 0 && min_y == 0 && max_x == 64 && max_y == 64;
-	}
-};
-
-template<typename T>
-Dimensions GetDimensions(T * t, Dimensions d)
-{
-	if((!isTransparent(t[0]) && !isTransparent(t[64*64-1]))
-	|| (!isTransparent(t[63]) && !isTransparent(t[64*(64-1)])))
-	{
-		d.min_x = 0;
-		d.min_y = 0;
-		d.max_x = 64;
-		d.max_y = 64;
-		return d;
-	}
-
-	for(short y = 0; y < 64; ++y)
-	{
-		short min_x = SHRT_MAX;
-		short max_x = SHRT_MIN;
-
-		for(short x = 0; x < 64; ++x)
-		{
-			if(!isTransparent(t[y*64 + x]))
-			{
-				min_x = x;
-				max_x = x+1;
-				break;
-			}
-		}
-
-		for(short x = 63; x >= min_x; --x)
-		{
-			if(!isTransparent(t[y*64 + x]))
-			{
-				max_x = x+1;
-				break;
-			}
-		}
-
-		if(min_x <= max_x)
-		{
-			d.min_x = std::min(min_x, d.min_x);
-			d.max_x = std::max(max_x, d.max_x);
-			d.min_y = std::min(y    , d.min_y);
-			d.max_y = y+1;
-		}
-	}
-
-	return d;
-}
-
-
-int BackgroundFile::CreateTileDimensions()
+void BackgroundFile::CreateTileDimensions(AlphaFile & alpha_file)
 {
 	SetTileCount(base_color);
 	SetTileCount(depth);
@@ -576,48 +673,56 @@ int BackgroundFile::CreateTileDimensions()
 
 	tile_info = std::unique_ptr<TileInfo[]>(new TileInfo[length()]);
 
-	int set = 0;
-
-	for(int i = 0; i < length(); ++i)
+	if(alpha_file.empty())
 	{
-		BC5_Block * dp = depth[0][i].get();
+		for(int i = 0; i < length(); ++i)
+			tile_info[i].flags = (uint16_t)0xFFFFF;
+	}
+	else
+	{
+		for(int i = 0; i < length(); ++i)
+			tile_info[i] = GetDimensions(alpha_file, i);
 
-		Dimensions d;
-
-		d = GetDimensions(dp, d);
-
-		if(!d.isFull())
-		{
-			if(base_color[0]    != nullptr
-			&& base_color[0][i] != nullptr)
-			{
-				d = GetDimensions(base_color[0][i].get(), d);
-			}
-		}
-
-		TileInfo * info = &tile_info[i];
-
-		if(d.max_x < d.min_x)
-		{
-			info->x0 = 0;
-			info->y0 = 0;
-			info->x1 = 0;
-			info->y1 = 0;
-		}
-		else
-		{
-			info->x0 = d.min_x / 4;
-			info->y0 = d.min_y / 4;
-			info->x1 = (d.max_x + 3) / 4;
-			info->y1 = (d.max_y + 3) / 4;
-		}
-
-		++set;
+		tile_info[length()-1] = GetDimensions(alpha_file, length()-1);
 	}
 
-	return set;
 }
 
+BackgroundFile::TileInfo BackgroundFile::GetDimensions(AlphaFile & alpha_file, int i)
+{
+	BackgroundFile::TileInfo  info;
+
+	for(int y = 0; y < 4; ++y)
+	{
+		for(int x = 0; x < 4; ++x)
+		{
+			info.setFlag(x, y, IsSubtileOpaque(alpha_file, x, y, i));
+		}
+	}
+
+	return info;
+}
+
+bool BackgroundFile::IsSubtileOpaque(AlphaFile & alpha_file, int sub_x, int sub_y, int i)
+{
+	const int start_x = (i % tiles_x) * 256 + sub_x * 64;
+	const int start_y = (i / tiles_x) * 256 + sub_y * 64;
+	const int end_x = start_x + 64;
+	const int end_y = start_y + 64;
+
+	for(int y = start_y; y < end_y; y += 4)
+	{
+		for(int x = start_x; x < end_x; x += 4)
+		{
+			if(alpha_file.GetMask(0, x, y))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+#if 0
 template<typename T>
 std::unique_ptr<T[]> ApplyTileDimensions(BackgroundFile::TileInfo & dimensions, std::unique_ptr<T[]> & blocks, int mip)
 {
@@ -645,28 +750,65 @@ std::unique_ptr<T[]> ApplyTileDimensions(BackgroundFile::TileInfo & dimensions, 
 }
 
 template<typename T>
+std::vector<T> ApplyTileDimensions(BackgroundFile::TileInfo & dimensions, std::vector<T> & blocks, int mip)
+{
+	size_t offset = 4 - mip;
+
+	if(typeid(T) != typeid(uint16_t))
+		offset -= 2;
+
+	const uint16_t x0 = dimensions.x0 << offset;
+	const uint16_t x1 = dimensions.x1 << offset;
+	const uint16_t y0 = dimensions.y0 << offset;
+	const uint16_t y1 = dimensions.y1 << offset;
+
+	const int16_t w  = x1 - x0;
+	const int16_t h  = y1 - y0;
+
+	std::vector<T> r(w*h);
+
+	for(int16_t y = 0; y < h; ++y)
+	{
+		memcpy(&r[y*w], &blocks[(y0 + y)*(64 >> mip) + x0] , w*sizeof(T));
+	}
+
+	return r;
+}
+
+template<typename T>
 void ApplyTileDimensionsTemplate(BackgroundFile * _this, std::unique_ptr<std::unique_ptr<T[]>[]> & it, int mip, int j)
 {
 	if(it == nullptr)
 		return;
 
-	if(_this->tile_info[j].x1 == 0)
+	if(_this->tile_info[j].widthBlocks() == 0)
 		it[j].reset();
 	else
 		it[j] = ApplyTileDimensions(_this->tile_info[j], it[j], mip);
 }
 
-
-void BackgroundFile::ApplyTileDimensions()
+template<typename T>
+void ApplyTileDimensionsTemplate(BackgroundFile * _this, std::vector<std::vector<T>> & it, int mip, int j)
 {
-	int max = CreateTileDimensions();
+	if(it.empty())
+		return;
 
+	if(_this->tile_info[j].widthBlocks() == 0)
+		it[j].clear();
+	else
+		it[j] = ApplyTileDimensions(_this->tile_info[j], it[j], mip);
+}
+
+void BackgroundFile::ApplyTileDimensions(AlphaFile & alpha_file)
+{
+	CreateTileDimensions(alpha_file);
+/*
 	if(max == 0)
 		return;
 
 	for(int j = 0; j < length(); ++j)
 	{
-		if(tile_info[j].x0 == 0 && tile_info[j].y0 == 0 && tile_info[j].x1 == 16 && tile_info[j].y1 == 16)
+		if(tile_info[j].widthBlocks() == 16 && tile_info[j].heightBlocks() == 16)
 			continue;
 
 		for(int i = 0; i < 3; ++i)
@@ -675,9 +817,11 @@ void BackgroundFile::ApplyTileDimensions()
 			ApplyTileDimensionsTemplate(this, normal[i], i, j);
 			ApplyTileDimensionsTemplate(this, base_color[i], i, j);
 			ApplyTileDimensionsTemplate(this, roughness[i], i, j);
+			ApplyTileDimensionsTemplate(this, occlusion[i], i, j);
 		}
-	}
+	}*/
 }
+#endif
 
 bool isTransparent(BC5_Block & m)
 {

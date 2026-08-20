@@ -6,7 +6,7 @@ class PngFile;
 class DepthFile;
 struct BlurStage;
 
-void BlurHeightMap(PngFile & dst, PngFile & src, DepthFile & depth, std::vector<BlurStage> const& stages);
+//void BlurHeightMap(PngFile & dst, PngFile & src, DepthFile & depth, std::vector<BlurStage> const& stages);
 
 enum
 {

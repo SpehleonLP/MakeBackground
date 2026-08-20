@@ -4,28 +4,25 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <stdexcept>
+#include <vector>
 
 void LinearImage::toPng(PngFile & png) const
 {
 	png.size         = size;
-	png.color_type   = PngFile::ColorType::RGB;
-	png.bit_depth    = 8;
+	png.bit_depth    = bit_depth == 16? 16 : 8;
 	png.channels     = channels;
-	png.bytesPerRow  = channels * width();
+	png.bytesPerRow  = channels * width() * (bit_depth == 16? 2 : 1);
 	png.color_type   = color_type;
 
 	png.Alloc();
 
-	for(int y = 0; y < height(); ++y)
-	{
-		auto      dst = (png.row_pointers[y]);
-		float   * src = &data[y*width()*channels];
-
-		for(int x = 0; x < width()*channels; ++x)
-		{
-			dst[x] = (uint8_t) std::max(0, std::min<int>(src[x] * 255.f, 255));
-		}
-	}
+	if(png.bit_depth == 8)
+		copyDataTo<uint8_t>(png, 256.f);
+	else if(png.bit_depth == 16)
+		copyDataTo<uint16_t>(png, 65536.f);
+	else
+		throw std::runtime_error("unknown bit depth");
 }
 
 void LinearImage::fromPng(PngFile & png)
@@ -36,101 +33,76 @@ void LinearImage::fromPng(PngFile & png)
 	channels   = png.channels;
 	type       = png.type;
 	color_type = png.color_type;
+	bit_depth  = png.bit_depth;
 
 	data.reset(new float[width()*height()*channels]);
 
-	for(int y = 0; y < height(); ++y)
-	{
-		auto      src = (png.row_pointers[y]);
-		float   * dst = &data[y*width()*channels];
-
-		for(int x = 0; x < width()*channels; ++x)
-		{
-			dst[x] = src[x] / 255.f;
-		}
-	}
+	if(png.bit_depth == 8)
+		copyDataFrom<uint8_t>(png, 256.f);
+	else if(png.bit_depth == 16)
+		copyDataFrom<uint16_t>(png, 65536.f);
+	else
+		throw std::runtime_error("unknown bit depth");
 }
 
-void LinearImage::LinearDownscale(const uint32_t * platform_mask, float * kernel, int length)
+float SUM(float const* array, int length)
 {
-	std::unique_ptr<float[]> scratch(new float[width()*height()*5/2]);
-	memset(&scratch[0], 0, width()*height()*5/2);
+	float r = 0;
+	while(--length >= 0) r += array[length];
+	return r;
+}
 
-	int w = width()/2;
-	int h = height()/2;
+void LinearImage::LinearDownscale(const uint32_t * platform_mask, std::array<float, 4> const& kernel)
+{
+	glm::ivec2 size0 = size;
+	glm::ivec2 size1 = (size >>= 1);
+
+	decltype(data) source(new float[size1.x*size1.y*channels]);
+	source.swap(data);
 
 //scale in X direction
-	for(int y = 0; y < height(); ++y)
+	for(int y = 0; y < size1.y; ++y)
 	{
-		int y_mask = (y & 1) * 8;
-
-		for(int x = 0; x < width(); x += 2)
+		for(int x = 0; x < size1.x; ++x)
 		{
-			float * px = &scratch[(y*w + x/2)*5];
+			const auto dstMask = platform_mask? platform_mask[y*size1.x+x] : ~0u;
+			glm::vec4 & dst = (glm::vec4&)data[(y*size1.x+x)*channels];
 
-			int x0 = (x+1) - (length)/2;
-			uint16_t p = platform_mask[(y/2)*w+x/2] & 0x0000FFFFF;
+			glm::vec4 summation{0.f};
+			float denominator = 0.f;
 
-			p = 0xFF & (p >> y_mask);
-			p >>= (8 - length)/2;
-
-			for(int i = 0; i < length; ++i)
+			for(int yd = -2; yd < 2; ++yd)
 			{
-				if(0 <= x0+i && x0+i < width()
-				&& ((p & (1 << i)) || kernel[i] < 0))
+				for(int xd = -2; xd < 2; ++xd)
 				{
-					for(int c = 0; c < channels; ++c)
-						px[c] += data[(y*width()+ x0+i)*channels+c] * kernel[i];
+					const float coeff = kernel[yd+2] * kernel[xd+2];
 
-					px[4] += kernel[i];
+					const int index = (yd+2)*4 + xd+2;
+					const int x0 = x*2 + xd;
+					const int y0 = y*2 + yd;
+					
+					if(!(0 <= x0 && x0 <= size0.x && 0 <= y0 && y0 <= size0.y))
+						continue;
+					
+					if((dstMask & (1 << index)) == 0)
+						continue;
+
+					glm::vec4 & px = (glm::vec4&) source[(y0*size0.x + x0)*channels];
+
+					for(int i = 0; i < channels; ++i)
+						summation[i] += px[i] * coeff;
+
+					denominator += coeff;
 				}
 			}
 
-			if(px[4] <= 0)
-				memset(&px[0], 0, sizeof(float) * 5);
+			if(denominator)
+				summation /= denominator;
+
+			for(int i = 0; i < channels; ++i)
+				dst[i] = summation[i];
 		}
 	}
-
-	data.reset(new float[width()*height()*channels/4]);
-
-//scale in Y direction...
-	for(int y = 0; y < height(); y += 2)
-	{
-		for(int x = 0; x < w; ++x)
-		{
-			float px[5]{0, 0, 0, 0, 0};
-
-			int y0 = (y+1) - (length-2)/2;
-
-			uint16_t p = (platform_mask[(y/2)*w+x] >> 16) & 0xFF;
-
-			p >>= (8 - length)/2;
-
-			for(int i = 0; i < length; ++i)
-			{
-				if(0 <= y0+i && y0+i < height()
-				&& ((p & (1 << i)) || kernel[i] < 0))
-				{
-					for(int c = 0; c < 4; ++c)
-						px[c] += scratch[((y0+i)*w+ x)*5+c] * kernel[i];
-
-					px[4] += std::fabs(scratch[((y0+i)*w+ x)*5+4]) * kernel[i];
-				}
-			}
-
-			if(px[4] <= 0)
-				memset(&data[((y/2)*w + x)*channels], 0, sizeof(float) * channels);
-			else
-			{
-				for(int c = 0; c < channels; ++c)
-				{
-					data[((y/2)*w + x)*channels+c] = px[c]/px[4];
-				}
-			}
-		}
-	}
-
-	size = glm::ivec2(w, h);
 }
 
 void LinearImage::toLinear()
@@ -140,7 +112,7 @@ void LinearImage::toLinear()
 	{
 	case bg_Type::Diffuse:
 	{
-		uint32_t chn = std::max(3, channels);
+		uint32_t chn = std::max<uint8_t>(3, channels);
 		uint32_t N   = height() * width() * channels;
 
 		for(uint32_t i = 0; i < N; i += channels)
@@ -178,7 +150,7 @@ void LinearImage::fromLinear()
 	{
 	case bg_Type::Diffuse:
 	{
-		uint32_t chn = std::max(3, channels);
+		uint32_t chn = std::max<uint8_t>(3, channels);
 		uint32_t N   = height() * width() * channels;
 
 		for(uint32_t i = 0; i < N; i += channels)
@@ -195,7 +167,7 @@ void LinearImage::fromLinear()
 	{
 		uint32_t N = height() * width() * channels;
 
-		for(uint32_t i = 0; i < N; i += 3)
+		for(uint32_t i = 0; i < N; i += channels)
 		{
 			glm::vec3 v = glm::vec3(data[i+0], data[i+1], data[i+2]);
 			v = glm::normalize(v);

@@ -1,9 +1,11 @@
 #include "blurheightmap.h"
+#if 0
 #include "depthfile.h"
 #include "height_mask.h"
 #include "backgroundexception.h"
 #include "blur_config.h"
 #include "png_file.h"
+#include <cstring>
 #include <algorithm>
 #include <array>
 
@@ -16,12 +18,12 @@ const glm::ivec2 kOffsets[] =
 const uint8_t kCorners[4] = {0, 2, 4, 6 };
 const uint8_t kSides[4] = {1, 3, 5, 7};
 
-static std::unique_ptr<glm::u8vec2[]> GetNeighborMask(const float * level, uint8_t const* platform, glm::ivec2 size, bool clamp_to_edge, bool itr_2 = false);
+static std::unique_ptr<glm::u8vec2[]> GetNeighborMask(const float * level, glm::ivec2 size, bool clamp_to_edge, bool itr_2 = false);
 static std::unique_ptr<float[]> CopyToFloat(PngFile &m);
 
 static void PngFromFloats(PngFile &, const float * values, glm::ivec2 size);
 static void To16BitGrey(PngFile &, PngFile & src);
-static std::unique_ptr<float[]> DiffuseStep(PngFile &m, std::unique_ptr<float[]> heights, uint8_t * platform, glm::u8vec2 * color_mask, const std::vector<BlurStage> & stages);
+static std::unique_ptr<float[]> DiffuseStep(PngFile &m, std::unique_ptr<float[]> heights, glm::u8vec2 * color_mask, const std::vector<BlurStage> & stages);
 
 void BlurHeightMap(PngFile & dst, PngFile & src, DepthFile & depth, std::vector<BlurStage> const& stages)
 {
@@ -37,20 +39,19 @@ void BlurHeightMap(PngFile & dst, PngFile & src, DepthFile & depth, std::vector<
 
 	if(stages.size())
 	{
-		auto mask = GetNeighborMask(height.get(), depth.GetPlatform(0), depth.size, false);
-		height    = DiffuseStep(src, std::move(height), depth.GetPlatform(0), mask.get(), stages);
+		auto mask = GetNeighborMask(height.get(), depth.size, false);
+		height    = DiffuseStep(src, std::move(height), mask.get(), stages);
 	}
 
 
 	PngFromFloats(dst, height.get(), depth.size);
 }
 
-template<typename T>
-uint8_t GetMaskValue(T const* array, glm::ivec2 size, int x, int y, bool clamp)
+glm::u8vec2 GetMaskValue(float const* array, glm::ivec2 size, int x, int y, bool clamp)
 {
 	const uint8_t current = array[y*size.x + x];
 
-	uint8_t value = 0;
+	glm::u8vec2 value = 0;
 
 	for(int i = 0; i < 8; ++i)
 	{
@@ -71,7 +72,7 @@ uint8_t GetMaskValue(T const* array, glm::ivec2 size, int x, int y, bool clamp)
 }
 
 
-std::unique_ptr<glm::u8vec2[]> GetNeighborMask(float const* level, uint8_t const* platform, glm::ivec2 size, bool clamp_to_edge, bool itr_2)
+std::unique_ptr<glm::u8vec2[]> GetNeighborMask(float const* level, glm::ivec2 size, bool clamp_to_edge, bool itr_2)
 {
 	std::unique_ptr<glm::u8vec2[]> r(new glm::u8vec2[size.x*size.y]);
 
@@ -80,16 +81,7 @@ std::unique_ptr<glm::u8vec2[]> GetNeighborMask(float const* level, uint8_t const
 	{
 		for(int x = 0; x < size.x; ++x)
 		{
-			r[y*size.x + x].r = GetMaskValue(level, size, x, y, clamp_to_edge);
-		}
-	}
-
-//copy level
-	for(int y = 0; y < size.y; ++y)
-	{
-		for(int x = 0; x < size.x; ++x)
-		{
-			r[y*size.x + x].g = GetMaskValue(platform, size, x, y, clamp_to_edge);
+			r[y*size.x + x] = GetMaskValue(level, size, x, y, clamp_to_edge);
 		}
 	}
 
@@ -223,7 +215,6 @@ struct DiffuseInfo : BlurStage
 {
 	DiffuseStepLogic * _this;
 
-	uint8_t * platform;
 	float * volatile* dst_ptr;
 	float * volatile* src_ptr;
 	PngFile * png;
@@ -281,7 +272,7 @@ public:
 
 			while((y = atomic_y++) < height)
 			{
-				auto min_max = in->row_min_max[y];
+			//	auto min_max = in->row_min_max[y];
 
 				if(in->color >= 0
 				&& !(in->row_min_max[y][0] <= in->color && in->color <= in->row_min_max[y][1]))
@@ -289,7 +280,7 @@ public:
 
 				for(int x = 0; x < width; ++x)
 				{
-					if(in->color >= 0 && (int)in->platform[y * width + x] != in->color)
+					if(in->color >= 0)
 						continue;
 
 					const float current = src[y* width+x];
@@ -347,9 +338,7 @@ public:
 						int p = in->png->row_pointers[c.y][c.x * in->png->channels + channel];
 						auto it_norm = in->min_max[c.y*width+c.x];
 
-						float diff;
-
-	//it is greater than us
+		//it is greater than us
 						if(p > q)
 						{
 	//get our slope
@@ -481,7 +470,7 @@ static void CommitPng(PngFile & m, float * heights)
 	}
 }
 
-std::unique_ptr<float[]> DiffuseStep(PngFile &m, std::unique_ptr<float[]> heights, uint8_t * platform, glm::u8vec2 * color_mask, std::vector<BlurStage> const & stages)
+std::unique_ptr<float[]> DiffuseStep(PngFile &m, std::unique_ptr<float[]> heights, glm::u8vec2 * color_mask, std::vector<BlurStage> const & stages)
 {
 
 	std::unique_ptr<float[]> delta(new float[m.width()*m.height()]);
@@ -498,7 +487,6 @@ std::unique_ptr<float[]> DiffuseStep(PngFile &m, std::unique_ptr<float[]> height
 	DiffuseStepLogic logic;
 
 	info._this   = &logic;
-	info.platform = platform;
 	info.dst_ptr = &dst;
 	info.src_ptr = &src;
 	info.png     = &m;
@@ -547,3 +535,5 @@ std::unique_ptr<float[]> DiffuseStep(PngFile &m, std::unique_ptr<float[]> height
 
 	return heights;
 }
+
+#endif

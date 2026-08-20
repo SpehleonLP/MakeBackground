@@ -32,6 +32,19 @@
 #define PNG_DEBUG 3
 #include <png.h>
 
+thread_local png_const_charp g_error_msg = "";
+
+void user_error_fn(png_structp png_ptr, png_const_charp error_msg)
+{
+	g_error_msg = error_msg;
+	longjmp(png_jmpbuf(png_ptr), 1);
+}
+
+void user_warning_fn(png_structp , png_const_charp warning_msg)
+{
+	fprintf(stderr, "%s\n", warning_msg);
+}
+
 FILE * open_file(const char* path, const char * mode)
 {
 	FILE* r{};
@@ -104,6 +117,104 @@ void PngFile::clear()
 	}
 }
 
+void PngFile::ReadHeader(FILE * fp, png_structp& png_ptr, png_infop& info_ptr)
+{
+	char header[8];
+
+/* open file and test for it being a png */
+
+	if (!fp)
+		throw std::system_error(errno, std::generic_category());
+
+	try
+	{
+		fread(header, 1, 8, fp);
+		if (png_sig_cmp((png_bytep)header, 0, 8))
+				throw LibPngException("[read_png_file] File is not a PNG file");
+
+		/* initialize stuff */
+		png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+
+		if (!png_ptr)
+		throw LibPngException("[read_png_file] png_create_read_struct failed");
+
+		info_ptr = png_create_info_struct(png_ptr);
+		if (!info_ptr)
+		throw LibPngException("[read_png_file] png_create_info_struct failed");
+
+		if (setjmp(png_jmpbuf(png_ptr)))
+		throw LibPngException("[read_png_file] Error during init_io");
+
+		png_set_error_fn(png_ptr, nullptr, user_error_fn, user_warning_fn);
+
+		png_init_io(png_ptr, fp);
+		png_set_sig_bytes(png_ptr, 8);
+
+		png_read_info(png_ptr, info_ptr);
+		png_set_swap(png_ptr);
+
+		size.x		= png_get_image_width(png_ptr, info_ptr);
+		size.y		= png_get_image_height(png_ptr, info_ptr);
+		color_type  = (ColorType) png_get_color_type(png_ptr, info_ptr);
+		bit_depth	= png_get_bit_depth(png_ptr, info_ptr);
+		channels	= png_get_channels(png_ptr, info_ptr);
+		bytesPerRow = png_get_rowbytes(png_ptr,info_ptr);
+
+		if (png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_PALETTE)
+			png_set_palette_to_rgb(png_ptr);
+	/*
+		if(isGrayScale())
+		{
+			if (setjmp(png_jmpbuf(png_ptr)))
+				throw std::runtime_error("[read_png_file] expected grayscale image");
+
+			if(png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_RGB
+			||png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_RGB_ALPHA)
+				png_set_rgb_to_gray_fixed(png_ptr, 2, -1, -1);
+		}*/
+
+		if (png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_GRAY &&  bit_depth < 8)
+		{
+			png_set_expand_gray_1_2_4_to_8(png_ptr);
+			bit_depth = 8;
+		}
+
+		if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS))
+			png_set_tRNS_to_alpha(png_ptr);
+
+		if(type == bg_Type::Occlusion)
+		{
+			int break_point = 0;
+			++break_point;
+
+		}
+
+		if(type == bg_Type::Depth || type == bg_Type::Occlusion)
+		{
+			if (color_type == ColorType::RGB ||
+				color_type == ColorType::RGBA)
+			{
+		//		png_set_rgb_to_gray_fixed(png_ptr, 1, -1,- 1);
+		//		color_type = ColorType::GRAY;
+		//		channels   = 1;
+			}
+		}
+
+		if(type == bg_Type::Depth && png_get_bit_depth(png_ptr, info_ptr) < 16)
+		{
+			png_set_expand_16(png_ptr);
+			bit_depth = 16;
+		}
+
+	//	if (png_get_bit_depth(png_ptr, info_ptr) == 16)	png_set_swap(png_ptr);
+	}
+	catch(...)
+	{
+		png_destroy_read_struct(&png_ptr, &info_ptr, nullptr);
+		throw;
+	}
+}
+
 void PngFile::ReadHeader()
 {
 	png_structp png_ptr{};
@@ -115,48 +226,11 @@ void PngFile::ReadHeader()
 		if(row_pointers != nullptr || doesExist() == false)
 			return;
 
-		char header[8];    // 8 is the maximum size that can be checked
-
-		int number_of_passes{};
-
 		FileHandle handle(open_file(path.c_str(), "rb"));
-		auto fp = handle.get();
-
-		if (!fp)
-			throw std::system_error(errno, std::generic_category());
-
-		fread(header, 1, 8, fp);
-		if (png_sig_cmp((png_bytep)header, 0, 8))
-			throw LibPngException("[read_png_file] File is not a PNG file");
-
-		/* initialize stuff */
-		png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-
-		if (!png_ptr)
-			throw LibPngException("[read_png_file] png_create_read_struct failed");
-
-		info_ptr = png_create_info_struct(png_ptr);
-		if (!info_ptr)
-			throw LibPngException("[read_png_file] png_create_info_struct failed");
-
-		if (setjmp(png_jmpbuf(png_ptr)))
-			throw LibPngException("[read_png_file] Error during init_io");
-
-		png_init_io(png_ptr, fp);
-		png_set_sig_bytes(png_ptr, 8);
-
-		png_read_info(png_ptr, info_ptr);
-
-		size.x = png_get_image_width(png_ptr, info_ptr);
-        size.y = png_get_image_height(png_ptr, info_ptr);
-		color_type = (ColorType) png_get_color_type(png_ptr, info_ptr);
-		bit_depth = png_get_bit_depth(png_ptr, info_ptr);
-		channels = png_get_channels(png_ptr, info_ptr);
-		bytesPerRow = png_get_rowbytes(png_ptr,info_ptr);
+		ReadHeader(handle.get(), png_ptr, info_ptr);
 	}
 	catch(std::exception const& e)
 	{
-		png_destroy_read_struct(&png_ptr, &info_ptr, nullptr);
 		throw FileException("Couldn't open: " + path + "\n  " + e.what());
 	}
 
@@ -170,88 +244,27 @@ void PngFile::Read()
 
 	int block_size = 16 >> mip;
 
-        char header[8];    // 8 is the maximum size that can be checked
+	png_structp png_ptr{};
+	png_infop info_ptr{};
 
-		png_structp png_ptr;
-		png_infop info_ptr{};
-		int number_of_passes{};
+	/* open file and test for it being a png */
+	FileHandle handle(open_file(path.c_str(), "rb"));
 
-        /* open file and test for it being a png */
-		FileHandle handle(open_file(path.c_str(), "rb"));
-		auto fp = handle.get();
-
-		try
-		{
-			if (!fp)
-				throw std::system_error(errno, std::generic_category());
-
-
-        fread(header, 1, 8, fp);
-        if (png_sig_cmp((png_bytep)header, 0, 8))
-			throw LibPngException("[read_png_file] File is not a PNG file");
-
-        /* initialize stuff */
-        png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-
-        if (!png_ptr)
-                throw LibPngException("[read_png_file] png_create_read_struct failed");
-
-        info_ptr = png_create_info_struct(png_ptr);
-        if (!info_ptr)
-                throw LibPngException("[read_png_file] png_create_info_struct failed");
-
-        if (setjmp(png_jmpbuf(png_ptr)))
-                throw LibPngException("[read_png_file] Error during init_io");
-
-        png_init_io(png_ptr, fp);
-        png_set_sig_bytes(png_ptr, 8);
-
-        png_read_info(png_ptr, info_ptr);
-
-		if (png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_PALETTE)
-			png_set_palette_to_rgb(png_ptr);
-/*
-		if(isGrayScale())
-		{
-			if (setjmp(png_jmpbuf(png_ptr)))
-				throw std::runtime_error("[read_png_file] expected grayscale image");
-
-			if(png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_RGB
-			||png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_RGB_ALPHA)
-				png_set_rgb_to_gray_fixed(png_ptr, 2, -1, -1);
-		}*/
-
-		if (png_get_color_type(png_ptr, info_ptr) == PNG_COLOR_TYPE_GRAY && png_get_bit_depth(png_ptr, info_ptr) < 8)
-			png_set_expand_gray_1_2_4_to_8(png_ptr);
-
-		if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS))
-			png_set_tRNS_to_alpha(png_ptr);
-
-	/*	if(isHighColor() && png_get_bit_depth(png_ptr, info_ptr) < 16)
-		{
-			png_set_expand_16(png_ptr);
-		}*/
-
-	//	if (png_get_bit_depth(png_ptr, info_ptr) == 16)	png_set_swap(png_ptr);
-
-        size.x = png_get_image_width(png_ptr, info_ptr);
-        size.y = png_get_image_height(png_ptr, info_ptr);
-        color_type = (ColorType) png_get_color_type(png_ptr, info_ptr);
-        bit_depth = png_get_bit_depth(png_ptr, info_ptr);
-		channels = png_get_channels(png_ptr, info_ptr);
-		bytesPerRow = png_get_rowbytes(png_ptr,info_ptr);
+	try
+	{
+		ReadHeader(handle.get(), png_ptr, info_ptr);
 
 		if(width() % block_size != 0
 		|| height() % block_size != 0)
 			throw BackgroundException("dimensions must be easily divisible by " + std::to_string(block_size));
 
-        number_of_passes = png_set_interlace_handling(png_ptr);
+        png_set_interlace_handling(png_ptr);
         png_read_update_info(png_ptr, info_ptr);
 
         /* read file */
         if (setjmp(png_jmpbuf(png_ptr)))
 		{
-                throw LibPngException("[read_png_file] Error during read_image");
+            throw LibPngException("[read_png_file] Error during read_image: ", g_error_msg);
 		}
 
 		Alloc();
@@ -262,40 +275,32 @@ void PngFile::Read()
 	}
 	catch(std::exception const& e)
 	{
-		png_destroy_read_struct(&png_ptr, &info_ptr, nullptr);
 		throw FileException("Couldn't open: " + path + "\n  " + e.what());
 	}
 
 	png_destroy_read_struct(&png_ptr, &info_ptr, nullptr);
 }
 
-double lancoz(float x, float a)
+constexpr float lancoz(float x, float a)
 {
 	return a * std::sin(M_PI * x) * std::sin(M_PI * x / a) / (M_PI * M_PI * x * x);
 }
 
-void PngFile::Scale(DepthFile & depth, PngFile & it)
+void PngFile::Scale(DepthFile & depth, PngFile & source)
 {
-	static std::vector<float> kernel;
-
-	if(kernel.empty())
-	{
-		kernel.resize(4);
-
-		kernel[0] = lancoz(-1.5, 2);
-		kernel[1] = lancoz(- .5, 2);
-		kernel[2] = lancoz(  .5, 2);
-		kernel[3] = lancoz( 1.5, 2);
-	}
+	static std::array<float, 4> kernel{
+		lancoz(-1.5, 2),
+		lancoz(- .5, 2),
+		lancoz(- .5, 2),
+		lancoz( 1.5, 2) };
 
 	LinearImage img;
 
-	img.fromPng(it);
+	img.fromPng(source);
 	img.toLinear();
-	img.LinearDownscale(depth.GetPlatformMask(it.mip), &kernel[0], kernel.size());
+	img.LinearDownscale(depth.GetPlatformMask(source.mip), kernel);
 	img.fromLinear();
 	img.toPng(*this);
-
 
 
 #if 0
@@ -349,7 +354,7 @@ void PngFile::Write()
 
         /* write header */
         if (setjmp(png_jmpbuf(png_ptr)))
-                throw LibPngException("[write_png_file] Error during writing header");
+			throw LibPngException("[write_png_file] Error during writing header");
 
         png_set_IHDR(png_ptr, info_ptr, width(), height(),
                      bit_depth, (png_byte) color_type, PNG_INTERLACE_NONE,
@@ -360,7 +365,7 @@ void PngFile::Write()
 
         /* write bytes */
         if (setjmp(png_jmpbuf(png_ptr)))
-                throw LibPngException("[write_png_file] Error during writing bytes");
+			throw LibPngException("[write_png_file] Error during writing bytes");
 
 		auto invRows = GetInvRows();
 		png_write_image(png_ptr, invRows.get());

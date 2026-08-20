@@ -24,8 +24,8 @@ public:
 		ALPHA_MASK = PNG_COLOR_MASK_ALPHA,
 	};
 
-	PngFile(std::string && path, bg_Type type, int mip) : FileBase(std::move(path)), type(type), mip(mip) {}
-	PngFile(std::string const& path, bg_Type type, int mip) : FileBase(path), type(type), mip(mip) {}
+	PngFile(std::string && path, bg_Type type, int mip) : FileBase(std::move(path)), mip(mip), type(type) {}
+	PngFile(std::string const& path, bg_Type type, int mip) : FileBase(path), mip(mip), type(type) {}
 	PngFile(PngFile const&) = delete;
 	PngFile(PngFile &&);
 	~PngFile();
@@ -37,18 +37,20 @@ public:
 	void Read();
 	void Write();
 
-	bg_Type type{};
-	int     mip{};
-	uint32_t bytesPerRow{};
 
 	int width() const { return size.x; }
 	int height() const { return size.y; }
 
 	glm::ivec2 size{0, 0};
+	int     mip{};
+
+	bg_Type type{};
 	ColorType color_type{};
 	png_byte bit_depth{};
 	png_byte channels{};
-	
+
+	uint32_t bytesPerRow{};
+
 	png_bytep * row_pointers{nullptr};
 	png_bytep   image{};
 
@@ -58,6 +60,7 @@ public:
 	std::unique_ptr<png_bytep[]> GetInvRows();
 
 private:
+	void ReadHeader(FILE * fp, png_structp & png_ptr, png_infop & info_ptr);
 };
 
 #endif // PNG_FILE_H

@@ -1,3 +1,4 @@
+
 #include "height_mask.h"
 #include "png_file.h"
 #include <vector>
@@ -94,3 +95,4 @@ std::unique_ptr<glm::ivec4[]> GetRowInfo(PngFile & in, uint32_t color)
 
 
 }
+

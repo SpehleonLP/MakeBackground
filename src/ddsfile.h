@@ -44,9 +44,15 @@ struct BC5_Block
 	BC4_Block  G;
 };
 
+struct DepthBlock
+{
+	uint16_t depth[16];
+};
+
 }
 
 class PngFile;
+class AlphaFile;
 
 class DDSFile : public FileBase
 {
@@ -65,7 +71,7 @@ public:
 	void Write();
 	void clear() { data.clear(); }
 
-	void create(PngFile ** files, bg_Type type, int layers);
+	void create(PngFile ** files, bg_Type type, int layers, AlphaFile & alpha);
 
 	void CreateMetallicRoughness(DDSFile & metal, DDSFile & rough);
 	void BitsFromImage(PngFile & file, int channel);
