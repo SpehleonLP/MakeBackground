@@ -9,24 +9,30 @@ CONFIG += c++14
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 INCLUDEPATH += \
-	../../Libraries/squish-1.11 \
-	../../Libraries/glfw-3.3/include/ \
-	../../Libraries/nativefiledialog/src/include/ \
-	../../Libraries/Boxer/include/ \
-	../../Libraries/fx-gltf/test/thirdparty/ \
-	../../Libraries/basis_universal/
+	/mnt/Passport/Libraries/squish-1.11 \
+	/mnt/Passport/Libraries/glfw-3.3/include/ \
+	/mnt/Passport/Libraries/nativefiledialog/src/include/ \
+	/mnt/Passport/Libraries/Boxer/include/ \
+	/mnt/Passport/Libraries/fx-gltf/test/thirdparty/ \
+	/mnt/Passport/Libraries/basis_universal/ \
+	/mnt/Passport/Libraries/fx-gltf/src/ \
+	/mnt/Passport/Libraries/
 
-LIBS += -pthread -L"/mnt/Passport/Libraries/squish-1.11" -lsquish -lpng -lz `pkg-config --libs gtk+-3.0`
+LIBS += -pthread -lpng \
+	-L"/mnt/Passport/Libraries/squish-1.11" -lsquish \
+	-L\"/mnt/Passport/Libraries/lz4/build/cmake\" -llz4 \
+	`pkg-config --libs gtk+-3.0`
 
 QMAKE_CXXFLAGS += `pkg-config --cflags gtk+-3.0`
 QMAKE_CFLAGS += `pkg-config --cflags gtk+-3.0`
 
 SOURCES += \
-    ../../Libraries/Boxer/src/boxer_linux.cpp \
-    ../../Libraries/nativefiledialog/src/nfd_common.c \
-    ../../Libraries/nativefiledialog/src/nfd_gtk.c \
+    /mnt/Passport/Libraries/Boxer/src/boxer_linux.cpp \
+    /mnt/Passport/Libraries/fx-gltf/src/fx/gltf.cpp \
+    /mnt/Passport/Libraries/nativefiledialog/src/nfd_common.c \
+    /mnt/Passport/Libraries/nativefiledialog/src/nfd_gtk.c \
     main.cpp \
-    src/alpha_mask.cpp \
+    src/alphafile.cpp \
     src/backgroundexception.cpp \
     src/backgroundfile.cpp \
     src/backgroundlayer.cpp \
@@ -37,18 +43,20 @@ SOURCES += \
     src/filebase.cpp \
     src/generatenormals.cpp \
     src/generateocclusion.cpp \
+    src/gltffile.cpp \
     src/height_mask.cpp \
-    src/huffmantree.cpp \
     src/linearimage.cpp \
     src/png_file.cpp
 
 HEADERS += \
-    ../../Libraries/nativefiledialog/src/common.h \
-    ../../Libraries/nativefiledialog/src/include/nfd.h \
-    ../../Libraries/nativefiledialog/src/nfd_common.h \
-    ../../Libraries/nativefiledialog/src/simple_exec.h \
+    /mnt/Passport/Libraries/fx-gltf/src/fx/gltf.h \
+    /mnt/Passport/Libraries/fx-gltf/test/thirdparty/nlohmann/json.hpp \
+    /mnt/Passport/Libraries/nativefiledialog/src/common.h \
+    /mnt/Passport/Libraries/nativefiledialog/src/include/nfd.h \
+    /mnt/Passport/Libraries/nativefiledialog/src/nfd_common.h \
+    /mnt/Passport/Libraries/nativefiledialog/src/simple_exec.h \
     src/UniqueCPtr.h \
-    src/alpha_mask.h \
+    src/alphafile.h \
     src/backgroundexception.h \
     src/backgroundfile.h \
     src/backgroundlayer.h \
@@ -61,8 +69,9 @@ HEADERS += \
     src/filebase.h \
     src/generatenormals.h \
     src/generateocclusion.h \
+    src/glm_iostream.hpp \
+    src/gltffile.h \
     src/height_mask.h \
-    src/huffmantree.h \
     src/linearimage.h \
     src/png_file.h
 
@@ -72,4 +81,4 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
 
 DISTFILES += \
-	../../Libraries/nativefiledialog/src/nfd_cocoa.m
+	/mnt/Passport/Libraries/nativefiledialog/src/nfd_cocoa.m

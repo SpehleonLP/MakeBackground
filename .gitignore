@@ -73,3 +73,5 @@ Thumbs.db
 *.dll
 *.exe
 
+build-check/
+build-check.log
