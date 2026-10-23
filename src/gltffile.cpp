@@ -198,7 +198,13 @@ static void EvaluateIndices(gltfFile * This, T const* indices, size_t count, siz
 		break;
 	case Mode::TriangleStrip:
 	{
-		This->indices.resize(This->indices.size() + count-2);
+		//	count is unsigned: fewer than three indices form no triangle, and count-2 would wrap.
+		if(count < 3)
+		{
+			break;
+		}
+
+		This->indices.resize(This->indices.size() + (count-2)*3);
 		auto begin = This->indices.data() + start;
 
 		for(uint32_t i = 0; i < count-2; ++i)
@@ -211,14 +217,19 @@ static void EvaluateIndices(gltfFile * This, T const* indices, size_t count, siz
 	break;
 	case Mode::TriangleFan:
 	{
-		This->indices.resize(This->indices.size() + (count-1)*3);
+		if(count < 3)
+		{
+			break;
+		}
+
+		This->indices.resize(This->indices.size() + (count-2)*3);
 		auto begin = This->indices.data() + start;
 
-		for(uint32_t i = 1; i < count; ++i)
+		for(uint32_t i = 1; i + 1 < count; ++i)
 		{
-			begin[i*3+0] = *indices + vertexOffset;
-			begin[i*3+1] = indices[i] + vertexOffset;
-			begin[i*3+2] = indices[1 + (i+1) % 3] + vertexOffset;
+			begin[(i-1)*3+0] = indices[0] + vertexOffset;
+			begin[(i-1)*3+1] = indices[i] + vertexOffset;
+			begin[(i-1)*3+2] = indices[i+1] + vertexOffset;
 		}
 	}
 	break;
